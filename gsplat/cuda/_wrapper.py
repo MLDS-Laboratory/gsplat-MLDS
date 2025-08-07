@@ -31,6 +31,7 @@ def spherical_harmonics(
     dirs: Tensor,  # [..., 3]
     coeffs: Tensor,  # [..., K, 3]
     masks: Optional[Tensor] = None,
+    num_output_channels: Optional[int] = 3,
 ) -> Tensor:
     """Computes spherical harmonics.
 
@@ -46,7 +47,7 @@ def spherical_harmonics(
     assert (degrees_to_use + 1) ** 2 <= coeffs.shape[-2], coeffs.shape
     assert dirs.shape[:-1] == coeffs.shape[:-2], (dirs.shape, coeffs.shape)
     assert dirs.shape[-1] == 3, dirs.shape
-    assert coeffs.shape[-1] == 3, coeffs.shape
+    assert coeffs.shape[-1] == num_output_channels, coeffs.shape
     if masks is not None:
         assert masks.shape == dirs.shape[:-1], masks.shape
         masks = masks.contiguous()
@@ -523,12 +524,12 @@ def rasterize_to_pixels(
         padded_channels = 0
 
     tile_height, tile_width = isect_offsets.shape[1:3]
-    assert (
-        tile_height * tile_size >= image_height
-    ), f"Assert Failed: {tile_height} * {tile_size} >= {image_height}"
-    assert (
-        tile_width * tile_size >= image_width
-    ), f"Assert Failed: {tile_width} * {tile_size} >= {image_width}"
+    assert tile_height * tile_size >= image_height, (
+        f"Assert Failed: {tile_height} * {tile_size} >= {image_height}"
+    )
+    assert tile_width * tile_size >= image_width, (
+        f"Assert Failed: {tile_width} * {tile_size} >= {image_width}"
+    )
 
     render_colors, render_alphas = _RasterizeToPixels.apply(
         means2d.contiguous(),
@@ -600,12 +601,12 @@ def rasterize_to_indices_in_range(
     assert isect_offsets.shape[0] == C, isect_offsets.shape
 
     tile_height, tile_width = isect_offsets.shape[1:3]
-    assert (
-        tile_height * tile_size >= image_height
-    ), f"Assert Failed: {tile_height} * {tile_size} >= {image_height}"
-    assert (
-        tile_width * tile_size >= image_width
-    ), f"Assert Failed: {tile_width} * {tile_size} >= {image_width}"
+    assert tile_height * tile_size >= image_height, (
+        f"Assert Failed: {tile_height} * {tile_size} >= {image_height}"
+    )
+    assert tile_width * tile_size >= image_width, (
+        f"Assert Failed: {tile_width} * {tile_size} >= {image_width}"
+    )
 
     out_gauss_ids, out_indices = _make_lazy_cuda_func("rasterize_to_indices_in_range")(
         range_start,
@@ -1693,12 +1694,12 @@ def rasterize_to_pixels_2dgs(
     else:
         padded_channels = 0
     tile_height, tile_width = isect_offsets.shape[1:3]
-    assert (
-        tile_height * tile_size >= image_height
-    ), f"Assert Failed: {tile_height} * {tile_size} >= {image_height}"
-    assert (
-        tile_width * tile_size >= image_width
-    ), f"Assert Failed: {tile_width} * {tile_size} >= {image_width}"
+    assert tile_height * tile_size >= image_height, (
+        f"Assert Failed: {tile_height} * {tile_size} >= {image_height}"
+    )
+    assert tile_width * tile_size >= image_width, (
+        f"Assert Failed: {tile_width} * {tile_size} >= {image_width}"
+    )
 
     (
         render_colors,
@@ -1780,12 +1781,12 @@ def rasterize_to_indices_in_range_2dgs(
     assert isect_offsets.shape[0] == C, isect_offsets.shape
 
     tile_height, tile_width = isect_offsets.shape[1:3]
-    assert (
-        tile_height * tile_size >= image_height
-    ), f"Assert Failed: {tile_height} * {tile_size} >= {image_height}"
-    assert (
-        tile_width * tile_size >= image_width
-    ), f"Assert Failed: {tile_width} * {tile_size} >= {image_width}"
+    assert tile_height * tile_size >= image_height, (
+        f"Assert Failed: {tile_height} * {tile_size} >= {image_height}"
+    )
+    assert tile_width * tile_size >= image_width, (
+        f"Assert Failed: {tile_width} * {tile_size} >= {image_width}"
+    )
 
     out_gauss_ids, out_indices = _make_lazy_cuda_func(
         "rasterize_to_indices_in_range_2dgs"
@@ -1893,7 +1894,6 @@ class _RasterizeToPixels2DGS(torch.autograd.Function):
         v_render_distort: Tensor,
         v_render_median: Tensor,
     ):
-
         (
             means2d,
             ray_transforms,

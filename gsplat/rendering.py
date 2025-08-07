@@ -51,6 +51,7 @@ def rasterization(
     distributed: bool = False,
     camera_model: Literal["pinhole", "ortho", "fisheye"] = "pinhole",
     covars: Optional[Tensor] = None,
+    num_output_channels: Optional[int] = None,
 ) -> Tuple[Tensor, Tensor, Dict]:
     """Rasterize a set of 3D Gaussians (N) to a batch of image planes (C).
 
@@ -181,6 +182,9 @@ def rasterization(
             and "fisheye". Default is "pinhole".
         covars: Optional covariance matrices of the Gaussians. If provided, the `quats` and
             `scales` will be ignored. [N, 3, 3], Default is None.
+        num_output_channels: Number of output channels to extract. If None, will be inferred
+            from the colors tensor. For spherical harmonics, this allows extracting fewer than
+            3 channels (e.g., for grayscale rendering). Default is None.
 
     Returns:
         A tuple:
@@ -250,28 +254,45 @@ def rasterization(
         )
         return torch.stack([torch.cat(l, dim=0) for l in zip(*view_list)], dim=0)
 
+    # Determine the number of output channels
+    if num_output_channels is None:
+        if sh_degree is None:
+            # For direct colors, infer from color tensor shape
+            if colors.dim() == 2:
+                num_output_channels = colors.shape[1]
+            elif colors.dim() == 3:
+                num_output_channels = colors.shape[2]
+        else:
+            # For spherical harmonics, default to 3 channels (RGB)
+            num_output_channels = 3
+
     if sh_degree is None:
         # treat colors as post-activation values, should be in shape [N, D] or [C, N, D]
         assert (colors.dim() == 2 and colors.shape[0] == N) or (
             colors.dim() == 3 and colors.shape[:2] == (C, N)
         ), colors.shape
         if distributed:
-            assert (
-                colors.dim() == 2
-            ), "Distributed mode only supports per-Gaussian colors."
+            assert colors.dim() == 2, (
+                "Distributed mode only supports per-Gaussian colors."
+            )
     else:
         # treat colors as SH coefficients, should be in shape [N, K, 3] or [C, N, K, 3]
         # Allowing for activating partial SH bands
+        # Note: SH always processes 3 channels internally, but we can extract fewer for output
         assert (
-            colors.dim() == 3 and colors.shape[0] == N and colors.shape[2] == 3
+            colors.dim() == 3
+            and colors.shape[0] == N
+            and colors.shape[2] == num_output_channels
         ) or (
-            colors.dim() == 4 and colors.shape[:2] == (C, N) and colors.shape[3] == 3
+            colors.dim() == 4
+            and colors.shape[:2] == (C, N)
+            and colors.shape[3] == num_output_channels
         ), colors.shape
         assert (sh_degree + 1) ** 2 <= colors.shape[-2], colors.shape
         if distributed:
-            assert (
-                colors.dim() == 3
-            ), "Distributed mode only supports per-Gaussian colors."
+            assert colors.dim() == 3, (
+                "Distributed mode only supports per-Gaussian colors."
+            )
 
     if absgrad:
         assert not distributed, "AbsGrad is not supported in distributed mode."
@@ -387,9 +408,22 @@ def rasterization(
             else:
                 # colors is already [C, N, K, 3]
                 shs = colors
-            colors = spherical_harmonics(sh_degree, dirs, shs, masks=masks)  # [C, N, 3]
+            if colors.shape[-1] == 1:
+                # We need to expand to 3 for SH rendering
+                shs = shs.expand(-1, -1, -1, 3)
+            colors = spherical_harmonics(
+                sh_degree,
+                dirs,
+                shs,
+                masks=masks,
+                num_output_channels=3,
+            )  # [C, N, 3]
         # make it apple-to-apple with Inria's CUDA Backend.
         colors = torch.clamp_min(colors + 0.5, 0.0)
+
+        # Extract only the required number of output channels from the SH result
+        if num_output_channels < 3:
+            colors = colors[..., :num_output_channels]
 
     # If in distributed mode, we need to scatter the GSs to the destination ranks, based
     # on which cameras they are visible to, which we already figured out in the projection
@@ -1139,7 +1173,9 @@ def rasterization_2dgs(
             "ED",
             "RGB+D",
             "RGB+ED",
-        ], f"distloss requires depth rendering, render_mode should be D, ED, RGB+D, RGB+ED, but got {render_mode}"
+        ], (
+            f"distloss requires depth rendering, render_mode should be D, ED, RGB+D, RGB+ED, but got {render_mode}"
+        )
 
     if sh_degree is None:
         # treat colors as post-activation values
@@ -1149,9 +1185,9 @@ def rasterization_2dgs(
         ), colors.shape
     else:
         # treat colors as SH coefficients. Allowing for activating partial SH bands
-        assert (
-            colors.dim() == 3 and colors.shape[0] == N and colors.shape[2] == 3
-        ), colors.shape
+        assert colors.dim() == 3 and colors.shape[0] == N and colors.shape[2] == 3, (
+            colors.shape
+        )
         assert (sh_degree + 1) ** 2 <= colors.shape[1], colors.shape
 
     # Compute Ray-Splat intersection transformation.
