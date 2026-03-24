@@ -313,6 +313,115 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> call_kernel_with_dim(
     return std::make_tuple(renders, alphas, last_ids);
 }
 
+template <uint32_t CDIM>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> call_kernel_with_dim_shadow(
+    // Gaussian parameters
+    const torch::Tensor &means2d,   // [C, N, 2] or [nnz, 2]
+    const torch::Tensor &conics,    // [C, N, 3] or [nnz, 3]
+    const torch::Tensor &colors,    // [C, N, channels] or [nnz, channels]
+    const torch::Tensor &opacities, // [C, N]  or [nnz]
+    const at::optional<torch::Tensor> &backgrounds, // [C, channels]
+    const at::optional<torch::Tensor> &masks, // [C, tile_height, tile_width]
+    // image size
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const uint32_t tile_size,
+    // intersections
+    const torch::Tensor &tile_offsets, // [C, tile_height, tile_width]
+    const torch::Tensor &flatten_ids,  // [n_isects]
+    const torch::Tensor &gaussian_ids,
+    const torch::Tensor &shadow_num,
+    const torch::Tensor &shadow_den
+) {
+    GSPLAT_DEVICE_GUARD(means2d);
+    GSPLAT_CHECK_INPUT(means2d);
+    GSPLAT_CHECK_INPUT(conics);
+    GSPLAT_CHECK_INPUT(colors);
+    GSPLAT_CHECK_INPUT(opacities);
+    GSPLAT_CHECK_INPUT(tile_offsets);
+    GSPLAT_CHECK_INPUT(flatten_ids);
+    if (backgrounds.has_value()) {
+        GSPLAT_CHECK_INPUT(backgrounds.value());
+    }
+    if (masks.has_value()) {
+        GSPLAT_CHECK_INPUT(masks.value());
+    }
+    bool packed = means2d.dim() == 2;
+
+    uint32_t C = tile_offsets.size(0);         // number of cameras
+    uint32_t N = packed ? 0 : means2d.size(1); // number of gaussians
+    uint32_t channels = colors.size(-1);
+    uint32_t tile_height = tile_offsets.size(1);
+    uint32_t tile_width = tile_offsets.size(2);
+    uint32_t n_isects = flatten_ids.size(0);
+
+    // Each block covers a tile on the image. In total there are
+    // C * tile_height * tile_width blocks.
+    dim3 threads = {tile_size, tile_size, 1};
+    dim3 blocks = {C, tile_height, tile_width};
+
+    torch::Tensor renders = torch::empty(
+        {C, image_height, image_width, channels},
+        means2d.options().dtype(torch::kFloat32)
+    );
+    torch::Tensor alphas = torch::empty(
+        {C, image_height, image_width, 1},
+        means2d.options().dtype(torch::kFloat32)
+    );
+    torch::Tensor last_ids = torch::empty(
+        {C, image_height, image_width}, means2d.options().dtype(torch::kInt32)
+    );
+
+    at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
+    const uint32_t shared_mem =
+        tile_size * tile_size *
+        (sizeof(int32_t) + sizeof(vec3<float>) + sizeof(vec3<float>));
+
+    // TODO: an optimization can be done by passing the actual number of
+    // channels into the kernel functions and avoid necessary global memory
+    // writes. This requires moving the channel padding from python to C side.
+    if (cudaFuncSetAttribute(
+            rasterize_to_pixels_fwd_kernel<CDIM, float>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            shared_mem
+        ) != cudaSuccess) {
+        AT_ERROR(
+            "Failed to set maximum shared memory size (requested ",
+            shared_mem,
+            " bytes), try lowering tile_size."
+        );
+    }
+    rasterize_to_pixels_fwd_kernel<CDIM, float>
+        <<<blocks, threads, shared_mem, stream>>>(
+            C,
+            N,
+            n_isects,
+            packed,
+            reinterpret_cast<vec2<float> *>(means2d.data_ptr<float>()),
+            reinterpret_cast<vec3<float> *>(conics.data_ptr<float>()),
+            colors.data_ptr<float>(),
+            opacities.data_ptr<float>(),
+            backgrounds.has_value() ? backgrounds.value().data_ptr<float>()
+                                    : nullptr,
+            masks.has_value() ? masks.value().data_ptr<bool>() : nullptr,
+            image_width,
+            image_height,
+            tile_size,
+            tile_width,
+            tile_height,
+            tile_offsets.data_ptr<int32_t>(),
+            flatten_ids.data_ptr<int32_t>(),
+            renders.data_ptr<float>(),
+            alphas.data_ptr<float>(),
+            last_ids.data_ptr<int32_t>(),
+            gaussian_ids.data_ptr<int32_t>(),
+            shadow_num.data_ptr<float>(),
+            shadow_den.data_ptr<float>()
+        );
+
+    return std::make_tuple(renders, alphas, last_ids, shadow_num, shadow_den);
+}
+
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
 rasterize_to_pixels_fwd_tensor(
     // Gaussian parameters
@@ -376,5 +485,79 @@ rasterize_to_pixels_fwd_tensor(
         AT_ERROR("Unsupported number of channels: ", channels);
     }
 }
+
+#undef __GS__CALL_
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+rasterize_to_pixels_fwd_shadow_tensor(
+    // Gaussian parameters
+    const torch::Tensor &means2d,   // [C, N, 2] or [nnz, 2]
+    const torch::Tensor &conics,    // [C, N, 3] or [nnz, 3]
+    const torch::Tensor &colors,    // [C, N, channels] or [nnz, channels]
+    const torch::Tensor &opacities, // [C, N]  or [nnz]
+    const at::optional<torch::Tensor> &backgrounds, // [C, channels]
+    const at::optional<torch::Tensor> &masks, // [C, tile_height, tile_width]
+    // image size
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const uint32_t tile_size,
+    // intersections
+    const torch::Tensor &tile_offsets, // [C, tile_height, tile_width]
+    const torch::Tensor &flatten_ids,  // [n_isects]
+    const torch::Tensor &gaussian_ids,
+    const torch::Tensor &shadow_num,
+    const torch::Tensor &shadow_den
+) {
+    GSPLAT_CHECK_INPUT(colors);
+    uint32_t channels = colors.size(-1);
+
+#define __GS__CALL_(N)                                                         \
+    case N:                                                                    \
+        return call_kernel_with_dim_shadow<N>(                                        \
+            means2d,                                                           \
+            conics,                                                            \
+            colors,                                                            \
+            opacities,                                                         \
+            backgrounds,                                                       \
+            masks,                                                             \
+            image_width,                                                       \
+            image_height,                                                      \
+            tile_size,                                                         \
+            tile_offsets,                                                      \
+            flatten_ids,                                                       \
+            gaussian_ids,                                                      \
+            shadow_num,                                                        \
+            shadow_den                                                         \
+        );
+
+    // TODO: an optimization can be done by passing the actual number of
+    // channels into the kernel functions and avoid necessary global memory
+    // writes. This requires moving the channel padding from python to C side.
+    switch (channels) {
+        __GS__CALL_(1)
+        __GS__CALL_(2)
+        __GS__CALL_(3)
+        __GS__CALL_(4)
+        __GS__CALL_(5)
+        __GS__CALL_(8)
+        __GS__CALL_(9)
+        __GS__CALL_(16)
+        __GS__CALL_(17)
+        __GS__CALL_(32)
+        __GS__CALL_(33)
+        __GS__CALL_(64)
+        __GS__CALL_(65)
+        __GS__CALL_(128)
+        __GS__CALL_(129)
+        __GS__CALL_(256)
+        __GS__CALL_(257)
+        __GS__CALL_(512)
+        __GS__CALL_(513)
+    default:
+        AT_ERROR("Unsupported number of channels: ", channels);
+    }
+}
+
+#undef __GS__CALL_
 
 } // namespace gsplat
