@@ -14,6 +14,7 @@ from .cuda._wrapper import (
     isect_tiles,
     rasterize_to_pixels,
     rasterize_to_pixels_2dgs,
+    rasterize_to_pixels_shadow_fwd,
     spherical_harmonics,
 )
 from .distributed import (
@@ -558,38 +559,15 @@ def rasterization(
         }
     )
 
-    # print("rank", world_rank, "Before rasterize_to_pixels")
-    if colors.shape[-1] > channel_chunk:
-        # slice into chunks
-        n_chunks = (colors.shape[-1] + channel_chunk - 1) // channel_chunk
-        render_colors, render_alphas = [], []
-        for i in range(n_chunks):
-            colors_chunk = colors[..., i * channel_chunk : (i + 1) * channel_chunk]
-            backgrounds_chunk = (
-                backgrounds[..., i * channel_chunk : (i + 1) * channel_chunk]
-                if backgrounds is not None
-                else None
-            )
-            render_colors_, render_alphas_ = rasterize_to_pixels(
-                means2d,
-                conics,
-                colors_chunk,
-                opacities,
-                width,
-                height,
-                tile_size,
-                isect_offsets,
-                flatten_ids,
-                backgrounds=backgrounds_chunk,
-                packed=packed,
-                absgrad=absgrad,
-            )
-            render_colors.append(render_colors_)
-            render_alphas.append(render_alphas_)
-        render_colors = torch.cat(render_colors, dim=-1)
-        render_alphas = render_alphas[0]  # discard the rest
-    else:
-        render_colors, render_alphas = rasterize_to_pixels(
+    shadow_num = None
+    shadow_den = None
+
+    if shadow_mode:
+        assert packed, "shadow_mode currently expects packed=True"
+        assert n_total_gaussians is not None, "Need n_total_gaussians in shadow_mode"
+
+        # For shadow accumulation, colors can be tiny dummy channels
+        render_colors, render_alphas, shadow_num, shadow_den = rasterize_to_pixels_shadow_fwd(
             means2d,
             conics,
             colors,
@@ -599,10 +577,97 @@ def rasterization(
             tile_size,
             isect_offsets,
             flatten_ids,
+            gaussian_ids=gaussian_ids,  # type: ignore
+            n_total_gaussians=n_total_gaussians,
             backgrounds=backgrounds,
+            masks=None,
             packed=packed,
-            absgrad=absgrad,
         )
+    else:
+        # print("rank", world_rank, "Before rasterize_to_pixels")
+        if colors.shape[-1] > channel_chunk:
+            # slice into chunks
+            n_chunks = (colors.shape[-1] + channel_chunk - 1) // channel_chunk
+            render_colors, render_alphas = [], []
+            for i in range(n_chunks):
+                colors_chunk = colors[..., i * channel_chunk : (i + 1) * channel_chunk]
+                backgrounds_chunk = (
+                    backgrounds[..., i * channel_chunk : (i + 1) * channel_chunk] if backgrounds is not None else None
+                )
+                render_colors_, render_alphas_ = rasterize_to_pixels(
+                    means2d,
+                    conics,
+                    colors_chunk,
+                    opacities,
+                    width,
+                    height,
+                    tile_size,
+                    isect_offsets,
+                    flatten_ids,
+                    backgrounds=backgrounds_chunk,
+                    packed=packed,
+                    absgrad=absgrad,
+                )
+            render_colors.append(render_colors_)
+            render_alphas.append(render_alphas_)
+            render_colors = torch.cat(render_colors, dim=-1)
+            render_alphas = render_alphas[0]  # discard the rest
+        else:
+            render_colors, render_alphas = rasterize_to_pixels(
+                means2d,
+                conics,
+                colors,
+                opacities,
+                width,
+                height,
+                tile_size,
+                isect_offsets,
+                flatten_ids,
+                backgrounds=backgrounds,
+                packed=packed,
+                absgrad=absgrad,
+            )
+
+    if shadow_num is not None:
+        # raw averaged occlusion from the light pass
+        occ_i = torch.where(
+            shadow_den > 0,  # type: ignore
+            (shadow_num / shadow_den.clamp_min(1e-8)).clamp(0, 1),  # type: ignore
+            torch.zeros_like(shadow_num),
+        )
+        occ_i = torch.clamp(occ_i - 0.1, 0, 1)
+
+        # optional nonlinear sharpening
+        use_shadow_sigmoid = True
+        if use_shadow_sigmoid:
+            k = 10.0  # steepness / contrast
+            c = 0.6  # midpoint / threshold
+            occ_i = torch.sigmoid(k * (occ_i - c))
+
+        # convert occlusion -> visibility for final image multiplication
+        s_i = 1.0 - occ_i
+
+        meta.update(
+            {
+                "shadow_num": shadow_num,
+                "shadow_den": shadow_den,
+                "shadow_occ_i": occ_i,
+                "s_i": s_i,
+            }
+        )
+    # if shadow_num is not None:
+    #     meta.update(
+    #         {
+    #             "shadow_num": shadow_num,
+    #             "shadow_den": shadow_den,
+    #             "s_i": torch.where(
+    #                 shadow_den > 0,  # type: ignore
+    #                 (shadow_num / shadow_den.clamp_min(1e-8)).clamp(0, 1),  # type: ignore
+    #                 torch.ones_like(shadow_num),
+    #             ),
+    #         }
+    #     )
+
     if render_mode in ["ED", "RGB+ED"]:
         # normalize the accumulated depth to get the expected depth
         render_colors = torch.cat(
