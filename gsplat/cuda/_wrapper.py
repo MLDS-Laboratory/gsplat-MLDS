@@ -551,6 +551,51 @@ def rasterize_to_pixels(
     return render_colors, render_alphas
 
 
+def rasterize_to_pixels_shadow_fwd(
+    means2d: Tensor,
+    conics: Tensor,
+    colors: Tensor,
+    opacities: Tensor,
+    image_width: int,
+    image_height: int,
+    tile_size: int,
+    isect_offsets: Tensor,
+    flatten_ids: Tensor,
+    gaussian_ids: Tensor,  # [nnz] int32
+    n_total_gaussians: int,
+    backgrounds: Optional[Tensor] = None,
+    masks: Optional[Tensor] = None,
+    packed: bool = False,
+):
+    C = isect_offsets.size(0)
+    device = means2d.device
+
+    # CUDA kernel expects gaussian_ids as int32 indices.
+    gaussian_ids = gaussian_ids.to(dtype=torch.int32)
+
+    shadow_num = torch.zeros((n_total_gaussians,), device=device, dtype=torch.float32)
+    shadow_den = torch.zeros((n_total_gaussians,), device=device, dtype=torch.float32)
+
+    renders, alphas, last_ids, shadow_num, shadow_den = _make_lazy_cuda_func("rasterize_to_pixels_fwd_shadow")(
+        means2d.contiguous(),
+        conics.contiguous(),
+        colors.contiguous(),
+        opacities.contiguous(),
+        backgrounds,
+        masks,
+        image_width,
+        image_height,
+        tile_size,
+        isect_offsets.contiguous(),
+        flatten_ids.contiguous(),
+        gaussian_ids.contiguous(),
+        shadow_num,
+        shadow_den,
+    )
+
+    return renders, alphas.float(), shadow_num, shadow_den
+
+
 @torch.no_grad()
 def rasterize_to_indices_in_range(
     range_start: int,
