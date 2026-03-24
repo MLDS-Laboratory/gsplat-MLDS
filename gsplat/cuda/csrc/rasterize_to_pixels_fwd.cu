@@ -304,7 +304,10 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> call_kernel_with_dim(
             flatten_ids.data_ptr<int32_t>(),
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
-            last_ids.data_ptr<int32_t>()
+            last_ids.data_ptr<int32_t>(),
+            nullptr,
+            nullptr,
+            nullptr
         );
 
     return std::make_tuple(renders, alphas, last_ids);
