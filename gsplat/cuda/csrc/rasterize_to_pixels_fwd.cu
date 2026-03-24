@@ -34,7 +34,10 @@ __global__ void rasterize_to_pixels_fwd_kernel(
     const int32_t *__restrict__ flatten_ids,  // [n_isects]
     S *__restrict__ render_colors, // [C, image_height, image_width, COLOR_DIM]
     S *__restrict__ render_alphas, // [C, image_height, image_width, 1]
-    int32_t *__restrict__ last_ids // [C, image_height, image_width]
+    int32_t *__restrict__ last_ids, // [C, image_height, image_width]
+    const int32_t *__restrict__ gaussian_ids, // [nnz], packed->global ids
+    float *__restrict__ shadow_num,           // [N_total] or nullptr
+    float *__restrict__ shadow_den            // [N_total] or nullptr
 ) {
     // each thread draws one pixel, but also timeshares caching gaussians in a
     // shared tile
@@ -143,7 +146,9 @@ __global__ void rasterize_to_pixels_fwd_kernel(
             const S sigma = 0.5f * (conic.x * delta.x * delta.x +
                                     conic.z * delta.y * delta.y) +
                             conic.y * delta.x * delta.y;
-            S alpha = min(0.999f, opac * __expf(-sigma));
+            const S beta = __expf(-sigma);
+            // S alpha = min(0.999f, opac * __expf(-sigma));
+            S alpha = min(0.999f, opac * beta);
             if (sigma < 0.f || alpha < 1.f / 255.f) {
                 continue;
             }
@@ -156,6 +161,23 @@ __global__ void rasterize_to_pixels_fwd_kernel(
 
             int32_t g = id_batch[t];
             const S vis = alpha * T;
+            
+            if (shadow_num != nullptr) {
+                int32_t g_packed = id_batch[t];
+                int32_t gid = packed ? gaussian_ids[g_packed] : g_packed;
+                const S occ_before = 1.0f - T;   // cumulative opacity before current Gaussian
+                const S w = beta;                // projected 2D Gaussian density weight
+
+                atomicAdd(&shadow_num[gid], (float)(w * occ_before));
+                atomicAdd(&shadow_den[gid], (float)(w));
+                // atomicAdd(&shadow_num[gid], (float)(beta * T));
+                // atomicAdd(&shadow_den[gid], (float)(beta));
+                // atomicAdd(&shadow_num[gid], (float)(sigma * T));
+                // atomicAdd(&shadow_den[gid], (float)(sigma));
+                // atomicAdd(&shadow_num[gid], (float)(vis * T)); //uses VIS instead of density, mayb explore diff options?
+                // atomicAdd(&shadow_den[gid], (float)(vis));
+            }
+
             const S *c_ptr = colors + g * COLOR_DIM;
             GSPLAT_PRAGMA_UNROLL
             for (uint32_t k = 0; k < COLOR_DIM; ++k) {
