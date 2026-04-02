@@ -10,6 +10,16 @@ from .ops import duplicate, remove, reset_opa, split
 @dataclass
 class MeshAwareStrategy(DefaultStrategy):
     use_mesh_pruning: bool = True
+    # bc densification can add Gaussians after og masks created, pad to ensure numerical stability
+    @staticmethod
+    def _align_mask_length(mask: torch.Tensor, target_len: int, fill_value: bool = False) -> torch.Tensor:
+        cur_len = mask.shape[0]
+        if cur_len == target_len:
+            return mask
+        if cur_len > target_len:
+            return mask[:target_len]
+        pad = torch.full((target_len - cur_len,), fill_value, dtype=torch.bool, device=mask.device)
+        return torch.cat([mask, pad], dim=0)
 
     def step_pre_backward(
         self,
