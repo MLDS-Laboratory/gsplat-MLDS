@@ -540,15 +540,14 @@ def rasterization(
         }
     )
 
-    shadow_num = None
-    shadow_den = None
+    shadow_vis_num = None
+    shadow_vis_den = None
 
     if shadow_mode:
         assert packed, "shadow_mode currently expects packed=True"
         assert n_total_gaussians is not None, "Need n_total_gaussians in shadow_mode"
 
-        # For shadow accumulation, colors can be tiny dummy channels
-        render_colors, render_alphas, shadow_num, shadow_den = rasterize_to_pixels_shadow_fwd(
+        render_colors, render_alphas, shadow_vis_num, shadow_vis_den = rasterize_to_pixels_shadow_fwd(
             means2d,
             conics,
             colors,
@@ -610,45 +609,22 @@ def rasterization(
                 absgrad=absgrad,
             )
 
-    if shadow_num is not None:
-        # raw averaged occlusion from the light pass
-        occ_i = torch.where(
-            shadow_den > 0,  # type: ignore
-            (shadow_num / shadow_den.clamp_min(1e-8)).clamp(0, 1),  # type: ignore
-            torch.zeros_like(shadow_num),
+    if shadow_vis_num is not None:
+        shadow_vis_i = torch.where(
+            shadow_vis_den > 0,  # type: ignore
+            (shadow_vis_num / shadow_vis_den.clamp_min(1e-8)).clamp(0, 1),  # type: ignore
+            torch.ones_like(shadow_vis_num),
         )
-        occ_i = torch.clamp(occ_i - 0.1, 0, 1)
-
-        # optional nonlinear sharpening
-        use_shadow_sigmoid = True
-        if use_shadow_sigmoid:
-            k = 10.0  # steepness / contrast
-            c = 0.6  # midpoint / threshold
-            occ_i = torch.sigmoid(k * (occ_i - c))
-
-        # convert occlusion -> visibility for final image multiplication
-        s_i = 1.0 - occ_i
+        shadow_occ_i = 1.0 - shadow_vis_i
 
         meta.update(
             {
-                "shadow_num": shadow_num,
-                "shadow_den": shadow_den,
-                "shadow_occ_i": occ_i,
-                "s_i": s_i,
+                "shadow_vis_num": shadow_vis_num,
+                "shadow_vis_den": shadow_vis_den,
+                "shadow_vis_i": shadow_vis_i,
+                "shadow_occ_i": shadow_occ_i,
             }
         )
-    # if shadow_num is not None:
-    #     meta.update(
-    #         {
-    #             "shadow_num": shadow_num,
-    #             "shadow_den": shadow_den,
-    #             "s_i": torch.where(
-    #                 shadow_den > 0,  # type: ignore
-    #                 (shadow_num / shadow_den.clamp_min(1e-8)).clamp(0, 1),  # type: ignore
-    #                 torch.ones_like(shadow_num),
-    #             ),
-    #         }
-    #     )
 
     if render_mode in ["ED", "RGB+ED"]:
         # normalize the accumulated depth to get the expected depth
