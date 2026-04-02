@@ -552,6 +552,8 @@ def rasterize_to_pixels_shadow_fwd(
     backgrounds: Optional[Tensor] = None,
     masks: Optional[Tensor] = None,
     packed: bool = False,
+    shadow_alpha_threshold: float = 1.0 / 1024.0,
+    shadow_depth_group_eps: float = 0.0,
 ):
     C = isect_offsets.size(0)
     device = means2d.device
@@ -579,6 +581,8 @@ def rasterize_to_pixels_shadow_fwd(
         depths.contiguous(),
         shadow_num,
         shadow_den,
+        float(shadow_alpha_threshold),
+        float(shadow_depth_group_eps),
     )
 
     return renders, alphas.float(), shadow_num, shadow_den

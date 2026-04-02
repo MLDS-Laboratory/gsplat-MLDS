@@ -50,6 +50,8 @@ def rasterization(
     num_output_channels: Optional[int] = None,
     shadow_mode: bool = False,
     n_total_gaussians: Optional[int] = None,
+    shadow_alpha_threshold: float = 1.0 / 1024.0,
+    shadow_depth_group_eps: float = 0.0,
 ) -> Tuple[Tensor, Tensor, Dict]:
     """Rasterize a set of 3D Gaussians (N) to a batch of image planes (C).
 
@@ -563,9 +565,10 @@ def rasterization(
             backgrounds=backgrounds,
             masks=None,
             packed=packed,
+            shadow_alpha_threshold=shadow_alpha_threshold,
+            shadow_depth_group_eps=shadow_depth_group_eps,
         )
     else:
-        # print("rank", world_rank, "Before rasterize_to_pixels")
         if colors.shape[-1] > channel_chunk:
             # slice into chunks
             n_chunks = (colors.shape[-1] + channel_chunk - 1) // channel_chunk
@@ -589,10 +592,10 @@ def rasterization(
                     packed=packed,
                     absgrad=absgrad,
                 )
-            render_colors.append(render_colors_)
-            render_alphas.append(render_alphas_)
+                render_colors.append(render_colors_)
+                render_alphas.append(render_alphas_)
             render_colors = torch.cat(render_colors, dim=-1)
-            render_alphas = render_alphas[0]  # discard the rest
+            render_alphas = render_alphas[0]
         else:
             render_colors, render_alphas = rasterize_to_pixels(
                 means2d,

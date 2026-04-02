@@ -38,7 +38,9 @@ __global__ void rasterize_to_pixels_fwd_kernel(
     const int32_t *__restrict__ gaussian_ids, // [nnz], packed->global ids
     const S *__restrict__ depths,
     float *__restrict__ shadow_num,           // [N_total] or nullptr
-    float *__restrict__ shadow_den            // [N_total] or nullptr
+    float *__restrict__ shadow_den,            // [N_total] or nullptr
+    const S shadow_alpha_threshold,
+    const S shadow_depth_group_eps
 ) {
     // each thread draws one pixel, but also timeshares caching gaussians in a
     // shared tile
@@ -270,7 +272,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> call_kernel_with_dim(
     at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
     const uint32_t shared_mem =
         tile_size * tile_size *
-        (sizeof(int32_t) + sizeof(vec3<float>) + sizeof(vec3<float>));
+        (sizeof(int32_t) + sizeof(vec3<float>) + sizeof(vec3<float>) + sizeof(float));
 
     // TODO: an optimization can be done by passing the actual number of
     // channels into the kernel functions and avoid necessary global memory
@@ -311,7 +313,10 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> call_kernel_with_dim(
             last_ids.data_ptr<int32_t>(),
             nullptr,
             nullptr,
-            nullptr
+            nullptr,
+            nullptr,
+            0.0f,
+            0.0f
         );
 
     return std::make_tuple(renders, alphas, last_ids);
@@ -336,7 +341,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     const torch::Tensor &gaussian_ids,
     const torch::Tensor &depths,
     const torch::Tensor &shadow_num,
-    const torch::Tensor &shadow_den
+    const torch::Tensor &shadow_den,
+    const float shadow_alpha_threshold,
+    const float shadow_depth_group_eps
 ) {
     GSPLAT_DEVICE_GUARD(means2d);
     GSPLAT_CHECK_INPUT(means2d);
@@ -423,7 +430,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             gaussian_ids.data_ptr<int32_t>(),
             depths.data_ptr<float>(),
             shadow_num.data_ptr<float>(),
-            shadow_den.data_ptr<float>()
+            shadow_den.data_ptr<float>(),
+            shadow_alpha_threshold,
+            shadow_depth_group_eps
         );
 
     return std::make_tuple(renders, alphas, last_ids, shadow_num, shadow_den);
@@ -514,14 +523,16 @@ rasterize_to_pixels_fwd_shadow_tensor(
     const torch::Tensor &gaussian_ids,
     const torch::Tensor &depths,
     const torch::Tensor &shadow_num,
-    const torch::Tensor &shadow_den
+    const torch::Tensor &shadow_den,
+    const float shadow_alpha_threshold,
+    const float shadow_depth_group_eps
 ) {
     GSPLAT_CHECK_INPUT(colors);
     uint32_t channels = colors.size(-1);
 
 #define __GS__CALL_(N)                                                         \
     case N:                                                                    \
-        return call_kernel_with_dim_shadow<N>(                                        \
+        return call_kernel_with_dim_shadow<N>(                                 \
             means2d,                                                           \
             conics,                                                            \
             colors,                                                            \
@@ -536,7 +547,9 @@ rasterize_to_pixels_fwd_shadow_tensor(
             gaussian_ids,                                                      \
             depths,                                                            \
             shadow_num,                                                        \
-            shadow_den                                                         \
+            shadow_den,                                                        \
+            shadow_alpha_threshold,                                            \
+            shadow_depth_group_eps                                             \
         );
 
     // TODO: an optimization can be done by passing the actual number of
