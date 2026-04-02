@@ -10,6 +10,9 @@ from .ops import duplicate, remove, reset_opa, split
 @dataclass
 class MeshAwareStrategy(DefaultStrategy):
     use_mesh_pruning: bool = True
+    protect_boundary: bool = True
+    boundary_grow_grad_scale: float = 1.0  # OPTIONAL: set < 1.0 to densify boundary-shell Gaussians more easily
+
     # bc densification can add Gaussians after og masks created, pad to ensure numerical stability
     @staticmethod
     def _align_mask_length(mask: torch.Tensor, target_len: int, fill_value: bool = False) -> torch.Tensor:
@@ -94,12 +97,26 @@ class MeshAwareStrategy(DefaultStrategy):
         grads = state["grad2d"] / count.clamp_min(1)
         device = grads.device
 
+        valid_parent = torch.ones_like(grads, dtype=torch.bool)
+        boundary_mask = None
+
+        if self.use_mesh_pruning and "mesh_outside_mask" in info:
+            outside_mask = self._align_mask_length(info["mesh_outside_mask"], grads.shape[0], fill_value=False)
+            valid_parent &= ~outside_mask
+            if "mesh_boundary_mask" in info:
+                boundary_mask = self._align_mask_length(info["mesh_boundary_mask"], grads.shape[0], fill_value=False)
+
+        grow_thresh = torch.full_like(grads, self.grow_grad2d)
+        if boundary_mask is not None and self.boundary_grow_grad_scale != 1.0:
+            # OPTIONAL: allow boundary-shell GSs to duplicate/split with a lower image-plane gradient.
+            grow_thresh = torch.where(
+                boundary_mask,
+                grow_thresh * self.boundary_grow_grad_scale,
+                grow_thresh,
+            )
+
         is_grad_high = grads > self.grow_grad2d
         is_small = torch.exp(params["scales"]).max(dim=-1).values <= self.grow_scale3d * state["scene_scale"]
-
-        valid_parent = torch.ones_like(is_grad_high, dtype=torch.bool)
-        if self.use_mesh_pruning and "mesh_outside_mask" in info:
-            valid_parent &= ~info["mesh_outside_mask"]
 
         is_dupli = is_grad_high & is_small & valid_parent
         n_dupli = is_dupli.sum().item()
@@ -144,25 +161,25 @@ class MeshAwareStrategy(DefaultStrategy):
             if step < self.refine_scale2d_stop_iter:
                 big_prune |= state["radii"] > self.prune_scale2d
 
-        # bc densification can add Gaussians after og masks created, pad to ensure numerical stability
-        def _align_mask_length(mask: torch.Tensor, target_len: int, fill_value: bool = False) -> torch.Tensor:
-            cur_len = mask.shape[0]
-            if cur_len == target_len:
-                return mask
-            if cur_len > target_len:
-                return mask[:target_len]
-            pad = torch.full((target_len - cur_len,), fill_value, dtype=torch.bool, device=mask.device)
-            return torch.cat([mask, pad], dim=0)
-
         if self.use_mesh_pruning and "mesh_outside_mask" in info:
             target_len = weak_prune.shape[0]
-            outside_mask = _align_mask_length(info["mesh_outside_mask"], target_len, fill_value=False)
-            inside_mask = _align_mask_length(
+            outside_mask = self._align_mask_length(info["mesh_outside_mask"], target_len, fill_value=False)
+            inside_mask = self._align_mask_length(
                 info.get("mesh_inside_mask", torch.zeros_like(outside_mask)),
                 target_len,
                 fill_value=False,
             )
-            is_prune = outside_mask | (weak_prune & ~inside_mask) | (big_prune & ~inside_mask)
+            boundary_mask = self._align_mask_length(
+                info.get("mesh_boundary_mask", torch.zeros_like(outside_mask)),
+                target_len,
+                fill_value=False,
+            )
+
+            protected_mask = inside_mask
+            if self.protect_boundary:
+                protected_mask = protected_mask | boundary_mask
+
+            is_prune = outside_mask | (weak_prune & ~protected_mask) | (big_prune & ~protected_mask)
         else:
             is_prune = weak_prune | big_prune
 
