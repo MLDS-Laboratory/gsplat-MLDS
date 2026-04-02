@@ -112,6 +112,9 @@ __global__ void rasterize_to_pixels_fwd_kernel(
     // index of most recent gaussian to write to this thread's pixel
     uint32_t cur_idx = 0;
 
+    const bool shadow_mode = shadow_num != nullptr;
+
+
     // collect and process batches of gaussians
     // each thread loads one gaussian at a time before rasterizing its
     // designated pixel
@@ -119,18 +122,14 @@ __global__ void rasterize_to_pixels_fwd_kernel(
 
     S pix_out[COLOR_DIM] = {0.f};
     for (uint32_t b = 0; b < num_batches; ++b) {
-        // resync all threads before beginning next batch
-        // end early if entire tile is done
         if (__syncthreads_count(done) >= block_size) {
             break;
         }
 
-        // each thread fetch 1 gaussian from front to back
-        // index of gaussian to load
         uint32_t batch_start = range_start + block_size * b;
         uint32_t idx = batch_start + tr;
         if (idx < range_end) {
-            int32_t g = flatten_ids[idx]; // flatten index in [C * N] or [nnz]
+            int32_t g = flatten_ids[idx];
             id_batch[tr] = g;
             const vec2<S> xy = means2d[g];
             const S opac = opacities[g];
@@ -139,12 +138,11 @@ __global__ void rasterize_to_pixels_fwd_kernel(
             depth_batch[tr] = depths != nullptr ? depths[g] : 0.0f;
         }
 
-        // wait for other threads to collect the gaussians in batch
         block.sync();
 
-        // process gaussians in the current batch for this pixel
         uint32_t batch_size = min(block_size, range_end - batch_start);
-        for (uint32_t t = 0; (t < batch_size) && !done; ++t) {
+        uint32_t t = 0;
+        while ((t < batch_size) && !done) {
             const vec3<S> conic = conic_batch[t];
             const vec3<S> xy_opac = xy_opacity_batch[t];
             const S opac = xy_opac.z;
@@ -153,35 +151,77 @@ __global__ void rasterize_to_pixels_fwd_kernel(
                                     conic.z * delta.y * delta.y) +
                             conic.y * delta.x * delta.y;
             const S beta = __expf(-sigma);
-            // S alpha = min(0.999f, opac * __expf(-sigma));
-            S alpha = min(0.999f, opac * beta);
-            if (sigma < 0.f || alpha < 1.f / 255.f) {
+            const S alpha = min(0.999f, opac * beta);
+            const S min_alpha = shadow_mode ? shadow_alpha_threshold : (S)(1.0f / 255.0f);
+
+            if (sigma < 0.f || alpha < min_alpha) {
+                ++t;
                 continue;
             }
 
-            const S next_T = T * (1.0f - alpha);
-            if (next_T <= 1e-4) { // this pixel is done: exclusive
-                done = true;
-                break;
+            if (shadow_mode && shadow_depth_group_eps > 0.0f) {
+                const S group_depth = depth_batch[t];
+                const S T_group = T;
+                S T_after_group = T_group;
+                uint32_t u = t;
+
+                while (u < batch_size) {
+                    const S depth_u = depth_batch[u];
+                    if ((depth_u - group_depth) > shadow_depth_group_eps) {
+                        break;
+                    }
+
+                    const vec3<S> conic_u = conic_batch[u];
+                    const vec3<S> xy_opac_u = xy_opacity_batch[u];
+                    const S opac_u = xy_opac_u.z;
+                    const vec2<S> delta_u = {xy_opac_u.x - px, xy_opac_u.y - py};
+                    const S sigma_u = 0.5f * (conic_u.x * delta_u.x * delta_u.x +
+                                              conic_u.z * delta_u.y * delta_u.y) +
+                                      conic_u.y * delta_u.x * delta_u.y;
+                    const S beta_u = __expf(-sigma_u);
+                    const S alpha_u = min(0.999f, opac_u * beta_u);
+
+                    if (!(sigma_u < 0.f || alpha_u < shadow_alpha_threshold)) {
+                        const int32_t g_u = id_batch[u];
+                        const int32_t gid_u = packed ? gaussian_ids[g_u] : g_u;
+                        const S w_u = beta_u;
+
+                        atomicAdd(&shadow_num[gid_u], (float)(w_u * T_group));
+                        atomicAdd(&shadow_den[gid_u], (float)(w_u));
+
+                        const S vis_u = alpha_u * T_after_group;
+                        const S *c_ptr_u = colors + g_u * COLOR_DIM;
+                        GSPLAT_PRAGMA_UNROLL
+                        for (uint32_t k = 0; k < COLOR_DIM; ++k) {
+                            pix_out[k] += c_ptr_u[k] * vis_u;
+                        }
+                        cur_idx = batch_start + u;
+                        T_after_group = T_after_group * (1.0f - alpha_u);
+                    }
+                    ++u;
+                }
+
+                T = T_after_group;
+                t = u;
+                continue;
             }
 
-            int32_t g = id_batch[t];
-            const S vis = alpha * T;
-            
-            if (shadow_num != nullptr) {
-                int32_t g_packed = id_batch[t];
-                int32_t gid = packed ? gaussian_ids[g_packed] : g_packed;
-                const S occ_before = 1.0f - T;   // cumulative opacity before current Gaussian
-                const S w = beta;                // projected 2D Gaussian density weight
+            const S T_before = T;
+            const S next_T = T_before * (1.0f - alpha);
 
-                atomicAdd(&shadow_num[gid], (float)(w * occ_before));
+            int32_t g = id_batch[t];
+            const S vis = alpha * T_before;
+
+            if (shadow_mode) {
+                int32_t gid = packed ? gaussian_ids[g] : g;
+                const S w = beta;
+                atomicAdd(&shadow_num[gid], (float)(w * T_before));
                 atomicAdd(&shadow_den[gid], (float)(w));
-                // atomicAdd(&shadow_num[gid], (float)(beta * T));
-                // atomicAdd(&shadow_den[gid], (float)(beta));
-                // atomicAdd(&shadow_num[gid], (float)(sigma * T));
-                // atomicAdd(&shadow_den[gid], (float)(sigma));
-                // atomicAdd(&shadow_num[gid], (float)(vis * T)); //uses VIS instead of density, mayb explore diff options?
-                // atomicAdd(&shadow_den[gid], (float)(vis));
+            }
+
+            if (!shadow_mode && next_T <= 1e-4f) {
+                done = true;
+                break;
             }
 
             const S *c_ptr = colors + g * COLOR_DIM;
@@ -190,8 +230,8 @@ __global__ void rasterize_to_pixels_fwd_kernel(
                 pix_out[k] += c_ptr[k] * vis;
             }
             cur_idx = batch_start + t;
-
             T = next_T;
+            ++t;
         }
     }
 
