@@ -559,6 +559,7 @@ def rasterization(
             isect_offsets,
             flatten_ids,
             gaussian_ids=gaussian_ids,  # type: ignore
+            depths=depths,  # type: ignore
             n_total_gaussians=n_total_gaussians,
             backgrounds=backgrounds,
             masks=None,

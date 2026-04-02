@@ -36,6 +36,7 @@ __global__ void rasterize_to_pixels_fwd_kernel(
     S *__restrict__ render_alphas, // [C, image_height, image_width, 1]
     int32_t *__restrict__ last_ids, // [C, image_height, image_width]
     const int32_t *__restrict__ gaussian_ids, // [nnz], packed->global ids
+    const S *__restrict__ depths,
     float *__restrict__ shadow_num,           // [N_total] or nullptr
     float *__restrict__ shadow_den            // [N_total] or nullptr
 ) {
@@ -98,6 +99,8 @@ __global__ void rasterize_to_pixels_fwd_kernel(
     vec3<S> *conic_batch =
         reinterpret_cast<vec3<float> *>(&xy_opacity_batch[block_size]
         ); // [block_size]
+    S *depth_batch =
+        reinterpret_cast<S *>(&conic_batch[block_size]);
 
     // current visibility left to render
     // transmittance is gonna be used in the backward pass which requires a high
@@ -131,6 +134,7 @@ __global__ void rasterize_to_pixels_fwd_kernel(
             const S opac = opacities[g];
             xy_opacity_batch[tr] = {xy.x, xy.y, opac};
             conic_batch[tr] = conics[g];
+            depth_batch[tr] = depths != nullptr ? depths[g] : 0.0f;
         }
 
         // wait for other threads to collect the gaussians in batch
@@ -330,6 +334,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     const torch::Tensor &tile_offsets, // [C, tile_height, tile_width]
     const torch::Tensor &flatten_ids,  // [n_isects]
     const torch::Tensor &gaussian_ids,
+    const torch::Tensor &depths,
     const torch::Tensor &shadow_num,
     const torch::Tensor &shadow_den
 ) {
@@ -340,6 +345,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     GSPLAT_CHECK_INPUT(opacities);
     GSPLAT_CHECK_INPUT(tile_offsets);
     GSPLAT_CHECK_INPUT(flatten_ids);
+    GSPLAT_CHECK_INPUT(depths);
     if (backgrounds.has_value()) {
         GSPLAT_CHECK_INPUT(backgrounds.value());
     }
@@ -375,7 +381,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
     const uint32_t shared_mem =
         tile_size * tile_size *
-        (sizeof(int32_t) + sizeof(vec3<float>) + sizeof(vec3<float>));
+        (sizeof(int32_t) + sizeof(vec3<float>) + sizeof(vec3<float>) + sizeof(float));
 
     // TODO: an optimization can be done by passing the actual number of
     // channels into the kernel functions and avoid necessary global memory
@@ -415,6 +421,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             alphas.data_ptr<float>(),
             last_ids.data_ptr<int32_t>(),
             gaussian_ids.data_ptr<int32_t>(),
+            depths.data_ptr<float>(),
             shadow_num.data_ptr<float>(),
             shadow_den.data_ptr<float>()
         );
@@ -505,6 +512,7 @@ rasterize_to_pixels_fwd_shadow_tensor(
     const torch::Tensor &tile_offsets, // [C, tile_height, tile_width]
     const torch::Tensor &flatten_ids,  // [n_isects]
     const torch::Tensor &gaussian_ids,
+    const torch::Tensor &depths,
     const torch::Tensor &shadow_num,
     const torch::Tensor &shadow_den
 ) {
@@ -526,6 +534,7 @@ rasterize_to_pixels_fwd_shadow_tensor(
             tile_offsets,                                                      \
             flatten_ids,                                                       \
             gaussian_ids,                                                      \
+            depths,                                                            \
             shadow_num,                                                        \
             shadow_den                                                         \
         );

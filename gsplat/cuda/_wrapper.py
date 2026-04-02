@@ -547,6 +547,7 @@ def rasterize_to_pixels_shadow_fwd(
     isect_offsets: Tensor,
     flatten_ids: Tensor,
     gaussian_ids: Tensor,  # [nnz] int32
+    depths: Tensor,
     n_total_gaussians: int,
     backgrounds: Optional[Tensor] = None,
     masks: Optional[Tensor] = None,
@@ -557,6 +558,7 @@ def rasterize_to_pixels_shadow_fwd(
 
     # CUDA kernel expects gaussian_ids as int32 indices.
     gaussian_ids = gaussian_ids.to(dtype=torch.int32)
+    depths = depths.to(dtype=torch.float32)
 
     shadow_num = torch.zeros((n_total_gaussians,), device=device, dtype=torch.float32)
     shadow_den = torch.zeros((n_total_gaussians,), device=device, dtype=torch.float32)
@@ -574,6 +576,7 @@ def rasterize_to_pixels_shadow_fwd(
         isect_offsets.contiguous(),
         flatten_ids.contiguous(),
         gaussian_ids.contiguous(),
+        depths.contiguous(),
         shadow_num,
         shadow_den,
     )

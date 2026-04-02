@@ -234,6 +234,7 @@ rasterize_to_pixels_fwd_shadow_tensor(
     const torch::Tensor &tile_offsets,
     const torch::Tensor &flatten_ids,
     const torch::Tensor &gaussian_ids, // [nnz], packed->global Gaussian ids
+    const torch::Tensor &depths,
     const torch::Tensor &shadow_num,   // [N_total], float32
     const torch::Tensor &shadow_den    // [N_total], float32
 );
