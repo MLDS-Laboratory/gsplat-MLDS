@@ -544,6 +544,8 @@ def rasterization(
 
     shadow_vis_num = None
     shadow_vis_den = None
+    shadow_vis_i = None
+    shadow_occ_i = None
 
     if shadow_mode:
         assert packed, "shadow_mode currently expects packed=True"
@@ -613,21 +615,22 @@ def rasterization(
             )
 
     if shadow_vis_num is not None:
-        shadow_vis_i = torch.where(
+        # The shadow kernel accumulates cumulative opacity / raw shadow (occlusion).
+        shadow_occ_i = torch.where(
             shadow_vis_den > 0,  # type: ignore
             (shadow_vis_num / shadow_vis_den.clamp_min(1e-8)).clamp(0, 1),  # type: ignore
-            torch.ones_like(shadow_vis_num),
+            torch.zeros_like(shadow_vis_num),
         )
-        shadow_occ_i = 1.0 - shadow_vis_i
+        shadow_vis_i = 1.0 - shadow_occ_i
 
-        meta.update(
-            {
-                "shadow_vis_num": shadow_vis_num,
-                "shadow_vis_den": shadow_vis_den,
-                "shadow_vis_i": shadow_vis_i,
-                "shadow_occ_i": shadow_occ_i,
-            }
-        )
+    meta.update(
+        {
+            "shadow_vis_num": shadow_vis_num,
+            "shadow_vis_den": shadow_vis_den,
+            "shadow_vis_i": shadow_vis_i,
+            "shadow_occ_i": shadow_occ_i,
+        }
+    )
 
     if render_mode in ["ED", "RGB+ED"]:
         # normalize the accumulated depth to get the expected depth
