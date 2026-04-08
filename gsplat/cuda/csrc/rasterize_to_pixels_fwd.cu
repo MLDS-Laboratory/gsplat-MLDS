@@ -185,8 +185,10 @@ __global__ void rasterize_to_pixels_fwd_kernel(
                         const int32_t g_u = id_batch[u];
                         const int32_t gid_u = packed ? gaussian_ids[g_u] : g_u;
                         const S w_u = beta_u;
-
-                        atomicAdd(&shadow_num[gid_u], (float)(w_u * T_group));
+                        
+                        //GS3-style raw shadow source = cumulative opacity before the group
+                        const S shadow_u = 1.0f - T_group;
+                        atomicAdd(&shadow_num[gid_u], (float)(w_u * shadow_u));
                         atomicAdd(&shadow_den[gid_u], (float)(w_u));
 
                         const S vis_u = alpha_u * T_after_group;
@@ -215,10 +217,11 @@ __global__ void rasterize_to_pixels_fwd_kernel(
             if (shadow_mode) {
                 int32_t gid = packed ? gaussian_ids[g] : g;
                 const S w = beta;
-                atomicAdd(&shadow_num[gid], (float)(w * T_before));
+                // GS3-style raw shadow source = cumulative opacity before this splat
+                const S shadow = 1.0f - T_before;
+                atomicAdd(&shadow_num[gid], (float)(w * shadow));
                 atomicAdd(&shadow_den[gid], (float)(w));
             }
-
             if (!shadow_mode && next_T <= 1e-4f) {
                 done = true;
                 break;
