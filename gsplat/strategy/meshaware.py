@@ -6,6 +6,12 @@ import torch
 from .default import DefaultStrategy
 from .ops import duplicate, duplicate_selected, remove, reset_opa, split
 
+# File-level mode for mesh-aware big-scale pruning.
+# - "inside_and_boundary": preserve both interior and boundary Gaussians from big-scale prune.
+# - "boundary_only": allow interior Gaussians to be big-pruned, but still preserve protected boundary Gaussians.
+# - "none": allow big-scale prune everywhere except explicit outside/backfill logic.
+BIG_GAUSSIAN_PROTECTION_MODE: Literal["inside_and_boundary", "boundary_only", "none"] = "none"
+
 
 @dataclass
 class MeshAwareStrategy(DefaultStrategy):
@@ -284,11 +290,24 @@ class MeshAwareStrategy(DefaultStrategy):
                 fill_value=False,
             )
 
-            protected_mask = inside_mask
+            weak_protected_mask = inside_mask
             if self.protect_boundary:
-                protected_mask = protected_mask | boundary_mask
+                weak_protected_mask = weak_protected_mask | boundary_mask
 
-            is_prune = outside_mask | (weak_prune & ~protected_mask) | (big_prune & ~protected_mask)
+            big_protected_mask = torch.zeros_like(inside_mask)
+            if BIG_GAUSSIAN_PROTECTION_MODE == "inside_and_boundary":
+                big_protected_mask = big_protected_mask | inside_mask
+                if self.protect_boundary:
+                    big_protected_mask = big_protected_mask | boundary_mask
+            elif BIG_GAUSSIAN_PROTECTION_MODE == "boundary_only":
+                if self.protect_boundary:
+                    big_protected_mask = big_protected_mask | boundary_mask
+            elif BIG_GAUSSIAN_PROTECTION_MODE == "none":
+                pass
+            else:
+                raise ValueError(f"Unknown BIG_GAUSSIAN_PROTECTION_MODE: {BIG_GAUSSIAN_PROTECTION_MODE}")
+
+            is_prune = outside_mask | (weak_prune & ~weak_protected_mask) | (big_prune & ~big_protected_mask)
 
             n_backfill = self._backfill_min_gaussians(
                 params=params,
@@ -309,6 +328,11 @@ class MeshAwareStrategy(DefaultStrategy):
                 )
         else:
             is_prune = weak_prune | big_prune
+
+        # optionally prune Gaussians that leave the random_scale box
+        outside_extent_mask = self._prune_outside_extent_mask(params)
+        if outside_extent_mask is not None:
+            is_prune = is_prune | outside_extent_mask
 
         n_prune = int(is_prune.sum().item())
         if n_prune > 0:

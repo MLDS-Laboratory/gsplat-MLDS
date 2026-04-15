@@ -125,6 +125,114 @@ def test_meshaware_min_gaussians_backfills_inside_candidates():
     assert (40.0, 0.0, 0.0) not in remaining_means
 
 
+
+# Modification test: prune Gaussians that leave the random_scale box.
+def test_default_strategy_prunes_gaussians_outside_extent():
+    from gsplat.strategy import DefaultStrategy
+
+    params = torch.nn.ParameterDict(
+        {
+            "means": torch.nn.Parameter(
+                torch.tensor(
+                    [
+                        [0.0, 0.0, 0.0],
+                        [0.6, 0.0, 0.0],
+                        [0.0, -0.7, 0.0],
+                    ]
+                )
+            ),
+            "scales": torch.nn.Parameter(torch.zeros(3, 3)),
+            "quats": torch.nn.Parameter(torch.randn(3, 4)),
+            "opacities": torch.nn.Parameter(torch.full((3,), 4.0)),
+        }
+    )
+    optimizers = {k: torch.optim.Adam([v], lr=1e-3) for k, v in params.items()}
+    state = {"scene_scale": 1.0}
+
+    strategy = DefaultStrategy(prune_opa=0.05, prune_outside_extent=1.0)
+    n_prune = strategy._prune_gs(params, optimizers, state, step=1)
+
+    assert n_prune == 2
+    assert params["means"].shape[0] == 1
+    assert torch.allclose(params["means"][0], torch.tensor([0.0, 0.0, 0.0]))
+
+
+# Modification test: prune Gaussians that leave the random_scale box.
+def test_meshaware_strategy_prunes_outside_extent_even_if_mesh_protected():
+    from gsplat.strategy import MeshAwareStrategy
+
+    params = torch.nn.ParameterDict(
+        {
+            "means": torch.nn.Parameter(
+                torch.tensor(
+                    [
+                        [0.0, 0.0, 0.0],
+                        [0.8, 0.0, 0.0],
+                        [0.2, 0.0, 0.0],
+                    ]
+                )
+            ),
+            "scales": torch.nn.Parameter(torch.zeros(3, 3)),
+            "quats": torch.nn.Parameter(torch.randn(3, 4)),
+            "opacities": torch.nn.Parameter(torch.full((3,), 4.0)),
+        }
+    )
+    optimizers = {k: torch.optim.Adam([v], lr=1e-3) for k, v in params.items()}
+    state = {"scene_scale": 1.0, "grad2d": torch.zeros(3), "count": torch.ones(3)}
+    info = {
+        "mesh_outside_mask": torch.zeros(3, dtype=torch.bool),
+        "mesh_inside_mask": torch.ones(3, dtype=torch.bool),
+        "mesh_boundary_mask": torch.zeros(3, dtype=torch.bool),
+    }
+
+    strategy = MeshAwareStrategy(prune_opa=0.05, prune_outside_extent=1.0)
+    n_prune = strategy._prune_gs(params, optimizers, state, step=1, info=info)
+
+    assert n_prune == 1
+    assert params["means"].shape[0] == 2
+    assert torch.all(params["means"].abs().max(dim=-1).values <= 0.5)
+
+
+def test_meshaware_strategy_can_prune_big_inside_gaussians():
+    from gsplat.strategy import MeshAwareStrategy
+
+    params = torch.nn.ParameterDict(
+        {
+            "means": torch.nn.Parameter(
+                torch.tensor(
+                    [
+                        [0.0, 0.0, 0.0],
+                        [0.2, 0.0, 0.0],
+                    ]
+                )
+            ),
+            "scales": torch.nn.Parameter(
+                torch.tensor(
+                    [
+                        [0.0, 0.0, 0.0],
+                        [3.0, 3.0, 3.0],
+                    ]
+                )
+            ),
+            "quats": torch.nn.Parameter(torch.randn(2, 4)),
+            "opacities": torch.nn.Parameter(torch.full((2,), 4.0)),
+        }
+    )
+    optimizers = {k: torch.optim.Adam([v], lr=1e-3) for k, v in params.items()}
+    state = {"scene_scale": 1.0, "grad2d": torch.zeros(2), "count": torch.ones(2)}
+    info = {
+        "mesh_outside_mask": torch.zeros(2, dtype=torch.bool),
+        "mesh_inside_mask": torch.ones(2, dtype=torch.bool),
+        "mesh_boundary_mask": torch.zeros(2, dtype=torch.bool),
+    }
+
+    strategy = MeshAwareStrategy(prune_opa=0.05, prune_scale3d=10.0, refine_scale2d_stop_iter=0)
+    n_prune = strategy._prune_gs(params, optimizers, state, step=5001, info=info)
+
+    assert n_prune == 1
+    assert params["means"].shape[0] == 1
+    assert torch.allclose(params["means"][0], torch.tensor([0.0, 0.0, 0.0]))
+
 def test_meshaware_min_gaussians_mode_outside_only_does_not_backfill_non_outside_prunes():
     from gsplat.strategy import MeshAwareStrategy
 
