@@ -14,7 +14,7 @@ from .cuda._wrapper import (
     isect_tiles,
     rasterize_to_pixels,
     rasterize_to_pixels_2dgs,
-    rasterize_to_pixels_shadow_fwd,
+    rasterize_to_pixels_shadow_only_fwd,
     spherical_harmonics,
 )
 from .distributed import all_gather_int32, all_gather_tensor_list, all_to_all_int32, all_to_all_tensor_list
@@ -52,6 +52,7 @@ def rasterization(
     n_total_gaussians: Optional[int] = None,
     shadow_alpha_threshold: float = 1.0 / 1024.0,
     shadow_depth_group_eps: float = 0.0,
+    shadow_return_images: bool = False,
 ) -> Tuple[Tensor, Tensor, Dict]:
     """Rasterize a set of 3D Gaussians (N) to a batch of image planes (C).
 
@@ -550,8 +551,10 @@ def rasterization(
     if shadow_mode:
         assert packed, "shadow_mode currently expects packed=True"
         assert n_total_gaussians is not None, "Need n_total_gaussians in shadow_mode"
+        if shadow_return_images:
+            raise ValueError("shadow_mode is metadata-only; light-view image outputs are temporarily deprecated")
 
-        render_colors, render_alphas, shadow_vis_num, shadow_vis_den = rasterize_to_pixels_shadow_fwd(
+        shadow_vis_num, shadow_vis_den = rasterize_to_pixels_shadow_only_fwd(
             means2d,
             conics,
             colors,
@@ -570,6 +573,8 @@ def rasterization(
             shadow_alpha_threshold=shadow_alpha_threshold,
             shadow_depth_group_eps=shadow_depth_group_eps,
         )
+        render_colors = torch.empty((0,), device=device, dtype=torch.float32)
+        render_alphas = torch.empty((0,), device=device, dtype=torch.float32)
     else:
         if colors.shape[-1] > channel_chunk:
             # slice into chunks

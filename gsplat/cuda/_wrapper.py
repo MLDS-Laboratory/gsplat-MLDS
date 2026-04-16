@@ -555,6 +555,7 @@ def rasterize_to_pixels_shadow_fwd(
     shadow_alpha_threshold: float = 1.0 / 1024.0,
     shadow_depth_group_eps: float = 0.0,
 ):
+    # active pipeline uses metadata-only shadow_mode plus exact shadow_den-based seen/unseen tests.
     C = isect_offsets.size(0)
     device = means2d.device
 
@@ -586,6 +587,56 @@ def rasterize_to_pixels_shadow_fwd(
     )
 
     return renders, alphas.float(), shadow_num, shadow_den
+
+
+def rasterize_to_pixels_shadow_only_fwd(
+    means2d: Tensor,
+    conics: Tensor,
+    colors: Tensor,
+    opacities: Tensor,
+    image_width: int,
+    image_height: int,
+    tile_size: int,
+    isect_offsets: Tensor,
+    flatten_ids: Tensor,
+    gaussian_ids: Tensor,  # [nnz] int32
+    depths: Tensor,
+    n_total_gaussians: int,
+    backgrounds: Optional[Tensor] = None,
+    masks: Optional[Tensor] = None,
+    packed: bool = False,
+    shadow_alpha_threshold: float = 1.0 / 1024.0,
+    shadow_depth_group_eps: float = 0.0,
+):
+    device = means2d.device
+
+    gaussian_ids = gaussian_ids.to(dtype=torch.int32)
+    depths = depths.to(dtype=torch.float32)
+
+    shadow_num = torch.zeros((n_total_gaussians,), device=device, dtype=torch.float32)
+    shadow_den = torch.zeros((n_total_gaussians,), device=device, dtype=torch.float32)
+
+    shadow_num, shadow_den = _make_lazy_cuda_func("rasterize_to_pixels_fwd_shadow_only")(
+        means2d.contiguous(),
+        conics.contiguous(),
+        colors.contiguous(),
+        opacities.contiguous(),
+        backgrounds,
+        masks,
+        image_width,
+        image_height,
+        tile_size,
+        isect_offsets.contiguous(),
+        flatten_ids.contiguous(),
+        gaussian_ids.contiguous(),
+        depths.contiguous(),
+        shadow_num,
+        shadow_den,
+        float(shadow_alpha_threshold),
+        float(shadow_depth_group_eps),
+    )
+
+    return shadow_num, shadow_den
 
 
 @torch.no_grad()

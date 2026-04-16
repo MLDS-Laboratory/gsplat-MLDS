@@ -241,6 +241,26 @@ rasterize_to_pixels_fwd_shadow_tensor(
     const float shadow_depth_group_eps
 );
 
+std::tuple<torch::Tensor, torch::Tensor> rasterize_to_pixels_fwd_shadow_only_tensor(
+    const torch::Tensor &means2d,
+    const torch::Tensor &conics,
+    const torch::Tensor &colors,
+    const torch::Tensor &opacities,
+    const at::optional<torch::Tensor> &backgrounds,
+    const at::optional<torch::Tensor> &masks,
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const uint32_t tile_size,
+    const torch::Tensor &tile_offsets,
+    const torch::Tensor &flatten_ids,
+    const torch::Tensor &gaussian_ids,
+    const torch::Tensor &depths,
+    const torch::Tensor &shadow_num,
+    const torch::Tensor &shadow_den,
+    const float shadow_alpha_threshold,
+    const float shadow_depth_group_eps
+);
+
 std::tuple<torch::Tensor, torch::Tensor> rasterize_to_indices_in_range_tensor(
     const uint32_t range_start,
     const uint32_t range_end,           // iteration steps
