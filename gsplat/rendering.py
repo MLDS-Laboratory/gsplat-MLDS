@@ -547,6 +547,7 @@ def rasterization(
     shadow_vis_den = None
     shadow_vis_i = None
     shadow_occ_i = None
+    shadow_seen_i = None
 
     if shadow_mode:
         assert packed, "shadow_mode currently expects packed=True"
@@ -620,9 +621,10 @@ def rasterization(
             )
 
     if shadow_vis_num is not None:
+        shadow_seen_i = shadow_vis_den > 0  # type: ignore
         # The shadow kernel accumulates cumulative opacity / raw shadow (occlusion).
         shadow_occ_i = torch.where(
-            shadow_vis_den > 0,  # type: ignore
+            shadow_seen_i,
             (shadow_vis_num / shadow_vis_den.clamp_min(1e-8)).clamp(0, 1),  # type: ignore
             torch.zeros_like(shadow_vis_num),
         )
@@ -634,6 +636,8 @@ def rasterization(
             "shadow_vis_den": shadow_vis_den,
             "shadow_vis_i": shadow_vis_i,
             "shadow_occ_i": shadow_occ_i,
+            "shadow_seen_i": shadow_seen_i,
+            "shadow_unseen_i": None if shadow_seen_i is None else ~shadow_seen_i,
         }
     )
 
