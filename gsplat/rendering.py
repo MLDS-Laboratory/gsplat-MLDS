@@ -31,6 +31,7 @@ def rasterization(
     Ks: Tensor,  # [C, 3, 3]
     width: int,
     height: int,
+    aux_colors: Optional[Tensor] = None,  # [(C,) N, D_aux]
     near_plane: float = 0.01,
     far_plane: float = 1e10,
     radius_clip: float = 0.0,
@@ -143,6 +144,9 @@ def rasterization(
         scales: The scales of the Gaussians. [N, 3]
         opacities: The opacities of the Gaussians. [N]
         colors: The colors of the Gaussians. [(C,) N, D] or [(C,) N, K, 3] for SH coefficients.
+        aux_colors: Optional extra direct-value channels to rasterize alongside the main
+            rendered colors. [(C,) N, D_aux]. These are concatenated ahead of the main
+            output channels and are never interpreted as SH coefficients.
         viewmats: The world-to-cam transformation of the cameras. [C, 4, 4]
         Ks: The camera intrinsics. [C, 3, 3]
         width: The width of the image.
@@ -191,9 +195,9 @@ def rasterization(
         A tuple:
 
         **render_colors**: The rendered colors. [C, height, width, X].
-        X depends on the `render_mode` and input `colors`. If `render_mode` is "RGB",
-        X is D; if `render_mode` is "D" or "ED", X is 1; if `render_mode` is "RGB+D" or
-        "RGB+ED", X is D+1.
+        X depends on the `render_mode`, `colors`, and optional `aux_colors`. If
+        `aux_colors` is provided, its channels are placed first, followed by the main
+        rendered color channels, followed by the depth channel when requested.
 
         **render_alphas**: The rendered alphas. [C, height, width, 1].
 
@@ -266,6 +270,21 @@ def rasterization(
         else:
             # For spherical harmonics, default to 3 channels (RGB)
             num_output_channels = 3
+
+    aux_channel_count = 0 if aux_colors is None else aux_colors.shape[-1]
+
+    if aux_colors is not None:
+        assert aux_colors.device == device, aux_colors.device
+        assert aux_colors.dim() in (2, 3), aux_colors.shape
+        assert (
+            aux_colors.shape[0] == N
+            if aux_colors.dim() == 2
+            else aux_colors.shape[:2] == (C, N)
+        ), aux_colors.shape
+        if distributed:
+            assert aux_colors.dim() == 2, "Distributed mode only supports per-Gaussian aux colors."
+        if render_mode in ["D", "ED"]:
+            raise ValueError("aux_colors requires render_mode to include RGB channels.")
 
     if sh_degree is None:
         # treat colors as post-activation values, should be in shape [N, D] or [C, N, D]
@@ -416,6 +435,19 @@ def rasterization(
         if num_output_channels < 3:
             colors = colors[..., :num_output_channels]
 
+    main_channel_count = colors.shape[-1]
+    if aux_colors is not None:
+        if packed:
+            if aux_colors.dim() == 2:
+                aux_colors = aux_colors[gaussian_ids]
+            else:
+                aux_colors = aux_colors[camera_ids, gaussian_ids]
+        else:
+            if aux_colors.dim() == 2:
+                aux_colors = aux_colors.expand(C, -1, -1)
+            else:
+                pass
+
     # If in distributed mode, we need to scatter the GSs to the destination ranks, based
     # on which cameras they are visible to, which we already figured out in the projection
     # stage.
@@ -430,12 +462,18 @@ def rasterization(
             # would have all the necessary GSs to render its own images.
             collected_splits = all_to_all_int32(world_size, cnts, device=device)
             (radii,) = all_to_all_tensor_list(world_size, [radii], cnts, output_splits=collected_splits)
-            (means2d, depths, conics, opacities, colors) = all_to_all_tensor_list(
+            packed_tensors = [means2d, depths, conics, opacities, colors]
+            if aux_colors is not None:
+                packed_tensors.append(aux_colors)
+            packed_outputs = all_to_all_tensor_list(
                 world_size,
-                [means2d, depths, conics, opacities, colors],
+                packed_tensors,
                 cnts,
                 output_splits=collected_splits,
             )
+            means2d, depths, conics, opacities, colors = packed_outputs[:5]
+            if aux_colors is not None:
+                aux_colors = packed_outputs[5]
 
             # before sending the data, we should turn the camera_ids from global to local.
             # i.e. the camera_ids produced by the projection stage are over all cameras world-wide,
@@ -480,25 +518,38 @@ def rasterization(
             )
             radii = reshape_view(C, radii, N_world)
 
-            (means2d, depths, conics, opacities, colors) = all_to_all_tensor_list(
+            dense_tensors = [
+                means2d.flatten(0, 1),
+                depths.flatten(0, 1),
+                conics.flatten(0, 1),
+                opacities.flatten(0, 1),
+                colors.flatten(0, 1),
+            ]
+            if aux_colors is not None:
+                dense_tensors.append(aux_colors.flatten(0, 1))
+            dense_outputs = all_to_all_tensor_list(
                 world_size,
-                [
-                    means2d.flatten(0, 1),
-                    depths.flatten(0, 1),
-                    conics.flatten(0, 1),
-                    opacities.flatten(0, 1),
-                    colors.flatten(0, 1),
-                ],
+                dense_tensors,
                 splits=[C_i * N for C_i in C_world],
                 output_splits=[C * N_i for N_i in N_world],
             )
-            means2d = reshape_view(C, means2d, N_world)
-            depths = reshape_view(C, depths, N_world)
-            conics = reshape_view(C, conics, N_world)
-            opacities = reshape_view(C, opacities, N_world)
-            colors = reshape_view(C, colors, N_world)
+            means2d = reshape_view(C, dense_outputs[0], N_world)
+            depths = reshape_view(C, dense_outputs[1], N_world)
+            conics = reshape_view(C, dense_outputs[2], N_world)
+            opacities = reshape_view(C, dense_outputs[3], N_world)
+            colors = reshape_view(C, dense_outputs[4], N_world)
+            if aux_colors is not None:
+                aux_colors = reshape_view(C, dense_outputs[5], N_world)
 
     # Rasterize to pixels
+    if aux_colors is not None:
+        colors = torch.cat((aux_colors, colors), dim=-1)
+        if backgrounds is not None:
+            backgrounds = torch.cat(
+                [torch.zeros(C, aux_channel_count, device=backgrounds.device, dtype=backgrounds.dtype), backgrounds],
+                dim=-1,
+            )
+
     if render_mode in ["RGB+D", "RGB+ED"]:
         colors = torch.cat((colors, depths[..., None]), dim=-1)
         if backgrounds is not None:
@@ -540,6 +591,9 @@ def rasterization(
             "height": height,
             "tile_size": tile_size,
             "n_cameras": C,
+            "aux_channel_count": aux_channel_count,
+            "main_channel_count": 0 if render_mode in ["D", "ED"] else main_channel_count,
+            "depth_channel_count": 1 if render_mode in ["D", "ED", "RGB+D", "RGB+ED"] else 0,
         }
     )
 
