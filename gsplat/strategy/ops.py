@@ -115,6 +115,41 @@ def duplicate(
 
 
 @torch.no_grad()
+def duplicate_selected(
+    params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+    optimizers: Dict[str, torch.optim.Optimizer],
+    state: Dict[str, Tensor],
+    sel: Tensor,
+):
+    """Inplace duplicate the Gaussians at the given indices.
+
+    Unlike :func:`duplicate`, this helper accepts explicit indices and supports
+    repeated parents, which is useful when a strategy needs to backfill a target
+    count from a smaller pool of preferred candidates.
+
+    Args:
+        params: A dictionary of parameters.
+        optimizers: A dictionary of optimizers, each corresponding to a parameter.
+        sel: A 1D tensor of Gaussian indices to duplicate. May contain repeats.
+    """
+    device = sel.device
+    sel = sel.to(dtype=torch.long)
+    if sel.numel() == 0:
+        return
+
+    def param_fn(name: str, p: Tensor) -> Tensor:
+        return torch.nn.Parameter(torch.cat([p, p[sel]], dim=0))
+
+    def optimizer_fn(key: str, v: Tensor) -> Tensor:
+        return torch.cat([v, torch.zeros((len(sel), *v.shape[1:]), device=device)])
+
+    _update_param_with_optimizer(param_fn, optimizer_fn, params, optimizers)
+    for k, v in state.items():
+        if isinstance(v, torch.Tensor):
+            state[k] = torch.cat((v, v[sel]), dim=0)
+
+
+@torch.no_grad()
 def split(
     params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
     optimizers: Dict[str, torch.optim.Optimizer],

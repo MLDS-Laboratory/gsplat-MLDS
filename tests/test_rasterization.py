@@ -87,3 +87,90 @@ def test_rasterization(
     )
     torch.testing.assert_close(renders, _renders, rtol=1e-4, atol=1e-4)
     torch.testing.assert_close(alphas, _alphas, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="No CUDA device")
+@pytest.mark.parametrize("sh_degree", [None, 3])
+@pytest.mark.parametrize("render_mode", ["RGB", "RGB+ED"])
+@pytest.mark.parametrize("packed", [True, False])
+@pytest.mark.parametrize("per_view_aux", [True, False])
+def test_rasterization_aux_colors(
+    sh_degree: Optional[int], render_mode: str, packed: bool, per_view_aux: bool
+):
+    from gsplat.rendering import rasterization
+
+    torch.manual_seed(123)
+
+    C, N = 2, 5_000
+    means = torch.rand(N, 3, device=device)
+    quats = torch.randn(N, 4, device=device)
+    scales = torch.rand(N, 3, device=device)
+    opacities = torch.rand(N, device=device)
+    if sh_degree is None:
+        colors = torch.rand(N, 3, device=device)
+    else:
+        colors = torch.rand(N, (sh_degree + 1) ** 2, 3, device=device)
+    aux_colors = torch.rand((C, N, 1), device=device) if per_view_aux else torch.rand((N, 1), device=device)
+
+    width, height = 160, 120
+    focal = 250.0
+    Ks = torch.tensor(
+        [[focal, 0.0, width / 2.0], [0.0, focal, height / 2.0], [0.0, 0.0, 1.0]],
+        device=device,
+    ).expand(C, -1, -1)
+    viewmats = torch.eye(4, device=device).expand(C, -1, -1)
+
+    fused_render, fused_alphas, fused_meta = rasterization(
+        means=means,
+        quats=quats,
+        scales=scales,
+        opacities=opacities,
+        colors=colors,
+        aux_colors=aux_colors,
+        viewmats=viewmats,
+        Ks=Ks,
+        width=width,
+        height=height,
+        sh_degree=sh_degree,
+        render_mode=render_mode,
+        packed=packed,
+    )
+    main_render, main_alphas, _ = rasterization(
+        means=means,
+        quats=quats,
+        scales=scales,
+        opacities=opacities,
+        colors=colors,
+        viewmats=viewmats,
+        Ks=Ks,
+        width=width,
+        height=height,
+        sh_degree=sh_degree,
+        render_mode=render_mode,
+        packed=packed,
+    )
+    aux_render, aux_alphas, _ = rasterization(
+        means=means,
+        quats=quats,
+        scales=scales,
+        opacities=opacities,
+        colors=aux_colors,
+        viewmats=viewmats,
+        Ks=Ks,
+        width=width,
+        height=height,
+        sh_degree=None,
+        render_mode="RGB",
+        packed=packed,
+        num_output_channels=1,
+    )
+
+    assert fused_meta["aux_channel_count"] == 1
+    assert fused_meta["main_channel_count"] == 3
+    assert fused_meta["depth_channel_count"] == (1 if render_mode == "RGB+ED" else 0)
+    torch.testing.assert_close(fused_render[..., :1], aux_render, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(fused_render[..., 1:4], main_render[..., :3], rtol=1e-4, atol=1e-4)
+    if render_mode == "RGB+ED":
+        torch.testing.assert_close(fused_render[..., 4:5], main_render[..., 3:4], rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(fused_alphas, main_alphas, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(fused_alphas, aux_alphas, rtol=1e-4, atol=1e-4)

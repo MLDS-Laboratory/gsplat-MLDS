@@ -1,11 +1,11 @@
 from dataclasses import dataclass
-from typing import Any, Dict, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
+from typing_extensions import Literal
 
 from .base import Strategy
 from .ops import duplicate, remove, reset_opa, split
-from typing_extensions import Literal
 
 
 @dataclass
@@ -92,6 +92,7 @@ class DefaultStrategy(Strategy):
     revised_opacity: bool = False
     verbose: bool = False
     key_for_gradient: Literal["means2d", "gradient_2dgs"] = "means2d"
+    prune_outside_extent: Optional[float] = None
 
     def initialize_state(self, scene_scale: float = 1.0) -> Dict[str, Any]:
         """Initialize and return the running state for this strategy.
@@ -144,9 +145,7 @@ class DefaultStrategy(Strategy):
         info: Dict[str, Any],
     ):
         """Callback function to be executed before the `loss.backward()` call."""
-        assert (
-            self.key_for_gradient in info
-        ), "The 2D means of the Gaussians is required but missing."
+        assert self.key_for_gradient in info, "The 2D means of the Gaussians is required but missing."
         info[self.key_for_gradient].retain_grad()
 
     def step_post_backward(
@@ -180,10 +179,7 @@ class DefaultStrategy(Strategy):
             # prune GSs
             n_prune = self._prune_gs(params, optimizers, state, step)
             if self.verbose:
-                print(
-                    f"Step {step}: {n_prune} GSs pruned. "
-                    f"Now having {len(params['means'])} GSs."
-                )
+                print(f"Step {step}: {n_prune} GSs pruned. Now having {len(params['means'])} GSs.")
 
             # reset running stats
             state["grad2d"].zero_()
@@ -249,9 +245,7 @@ class DefaultStrategy(Strategy):
             radii = info["radii"][sel]  # [nnz]
 
         state["grad2d"].index_add_(0, gs_ids, grads.norm(dim=-1))
-        state["count"].index_add_(
-            0, gs_ids, torch.ones_like(gs_ids, dtype=torch.float32)
-        )
+        state["count"].index_add_(0, gs_ids, torch.ones_like(gs_ids, dtype=torch.float32))
         if self.refine_scale2d_stop_iter > 0:
             # Should be ideally using scatter max
             state["radii"][gs_ids] = torch.maximum(
@@ -273,10 +267,7 @@ class DefaultStrategy(Strategy):
         device = grads.device
 
         is_grad_high = grads > self.grow_grad2d
-        is_small = (
-            torch.exp(params["scales"]).max(dim=-1).values
-            <= self.grow_scale3d * state["scene_scale"]
-        )
+        is_small = torch.exp(params["scales"]).max(dim=-1).values <= self.grow_scale3d * state["scene_scale"]
         is_dupli = is_grad_high & is_small
         n_dupli = is_dupli.sum().item()
 
@@ -319,10 +310,7 @@ class DefaultStrategy(Strategy):
     ) -> int:
         is_prune = torch.sigmoid(params["opacities"].flatten()) < self.prune_opa
         if step > self.reset_every:
-            is_too_big = (
-                torch.exp(params["scales"]).max(dim=-1).values
-                > self.prune_scale3d * state["scene_scale"]
-            )
+            is_too_big = torch.exp(params["scales"]).max(dim=-1).values > self.prune_scale3d * state["scene_scale"]
             # The official code also implements sreen-size pruning but
             # it's actually not being used due to a bug:
             # https://github.com/graphdeco-inria/gaussian-splatting/issues/123
@@ -333,8 +321,22 @@ class DefaultStrategy(Strategy):
 
             is_prune = is_prune | is_too_big
 
+        # Modification: optionally prune Gaussians that leave the random_scale box.
+        outside_extent_mask = self._prune_outside_extent_mask(params)
+        if outside_extent_mask is not None:
+            is_prune = is_prune | outside_extent_mask
+
         n_prune = is_prune.sum().item()
         if n_prune > 0:
             remove(params=params, optimizers=optimizers, state=state, mask=is_prune)
 
         return n_prune
+
+    def _prune_outside_extent_mask(
+        self,
+        params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+    ) -> Optional[torch.Tensor]:
+        if self.prune_outside_extent is None:
+            return None
+        half_extent = 0.5 * float(self.prune_outside_extent)
+        return (params["means"].abs() > half_extent).any(dim=-1)
