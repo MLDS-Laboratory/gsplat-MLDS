@@ -93,6 +93,7 @@ class DefaultStrategy(Strategy):
     verbose: bool = False
     key_for_gradient: Literal["means2d", "gradient_2dgs"] = "means2d"
     prune_outside_extent: Optional[float] = None
+    cap_max: Optional[int] = None
 
     def initialize_state(self, scene_scale: float = 1.0) -> Dict[str, Any]:
         """Initialize and return the running state for this strategy.
@@ -269,12 +270,43 @@ class DefaultStrategy(Strategy):
         is_grad_high = grads > self.grow_grad2d
         is_small = torch.exp(params["scales"]).max(dim=-1).values <= self.grow_scale3d * state["scene_scale"]
         is_dupli = is_grad_high & is_small
-        n_dupli = is_dupli.sum().item()
-
         is_large = ~is_small
         is_split = is_grad_high & is_large
         if step < self.refine_scale2d_stop_iter:
             is_split |= state["radii"] > self.grow_scale2d
+
+        remaining = None if self.cap_max is None else int(self.cap_max) - int(len(params["means"]))
+        if remaining is not None:
+            if remaining <= 0:
+                return 0, 0
+
+            dupli_idx = torch.where(is_dupli)[0]
+            split_idx = torch.where(is_split)[0]
+
+            if dupli_idx.numel() + split_idx.numel() > remaining:
+                # Keep the highest-gradient candidates first when growth exceeds the cap.
+                scores = grads
+
+                keep_dupli = min(int(dupli_idx.numel()), remaining)
+                if dupli_idx.numel() > keep_dupli:
+                    top_dupli = torch.topk(scores[dupli_idx], k=keep_dupli, sorted=False).indices
+                    kept_dupli_idx = dupli_idx[top_dupli]
+                    new_is_dupli = torch.zeros_like(is_dupli)
+                    new_is_dupli[kept_dupli_idx] = True
+                    is_dupli = new_is_dupli
+                    dupli_idx = kept_dupli_idx
+
+                remaining -= int(dupli_idx.numel())
+                if remaining <= 0:
+                    is_split = torch.zeros_like(is_split)
+                elif split_idx.numel() > remaining:
+                    top_split = torch.topk(scores[split_idx], k=remaining, sorted=False).indices
+                    kept_split_idx = split_idx[top_split]
+                    new_is_split = torch.zeros_like(is_split)
+                    new_is_split[kept_split_idx] = True
+                    is_split = new_is_split
+
+        n_dupli = is_dupli.sum().item()
         n_split = is_split.sum().item()
 
         # first duplicate
