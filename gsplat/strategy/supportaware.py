@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, Literal, Optional, Tuple, Union
 
 import torch
 
 from .default import DefaultStrategy
-from .ops import duplicate, remove, split
+from .ops import duplicate, duplicate_selected, remove, split
 
 
 @dataclass
@@ -33,7 +33,16 @@ class SupportAwareStrategy(DefaultStrategy):
     support_*_ema statistics are intentionally not reset, because they are meant
     to represent long-horizon multi-view evidence for whether a Gaussian is
     useful scene geometry.
+
+    The min-Gaussian extension in this file is the support-aware analog of a
+    mesh-aware minimum-count safeguard. Instead of selecting parents based on
+    mesh SDF depth, it selects parents from a localized, support-backed object
+    core inferred from the Gaussian cloud itself.
     """
+
+    # -------------------------------------------------------------------------
+    # Base persistent support-aware pruning settings.
+    # -------------------------------------------------------------------------
 
     # How slowly persistent support decays. Larger = longer memory.
     # With refine_every=10, 0.98 or 0.99 is usually more stable than 0.95.
@@ -59,11 +68,89 @@ class SupportAwareStrategy(DefaultStrategy):
     # This avoids protecting random early Gaussians before the field has settled.
     support_warmup_steps: int = 1000
 
-    # Usually False
+    # Usually False. Big-scale pruning targets a different failure mode than
+    # weak opacity pruning, so support should not protect big splats by default.
     support_protect_big: bool = False
 
     # If True, prints pruning diagnostics each refinement step.
     support_verbose: bool = True
+
+    # -------------------------------------------------------------------------
+    # MIN-GAUSSIANS ADDITION: configuration.
+    # -------------------------------------------------------------------------
+    # This is the support-aware analog of mesh-aware min_gaussians.
+    #
+    # The strategy prevents catastrophic collapse by duplicating high-quality
+    # parents if pruning would leave fewer than min_gaussians Gaussians.
+    #
+    # Unlike a naive minimum-count clamp, it does NOT pick arbitrary survivors.
+    # It builds a localized candidate pool from:
+    #   - high support_score,
+    #   - nontrivial opacity,
+    #   - not near the random/pruning box edge,
+    #   - near the robust center of the supported Gaussian cloud.
+    # -------------------------------------------------------------------------
+
+    min_gaussians: int = 0
+    """Minimum number of Gaussians to preserve by support-aware backfilling.
+
+    If <= 0, this feature is disabled.
+    """
+
+    min_gaussians_mode: Literal["weak_only", "weak_or_big", "always"] = "weak_only"
+    """Which pruning events can trigger support-aware backfilling.
+
+    weak_only:
+        Backfill only if low-opacity weak pruning would drop below min_gaussians.
+
+    weak_or_big:
+        Backfill if weak pruning or big-scale pruning would drop below min_gaussians.
+
+    always:
+        Backfill after any prune reason, including outside-extent pruning.
+    """
+
+    min_gaussians_start_step: int = 1000
+    """Do not run min-Gaussian backfill before this step.
+
+    This avoids locking in random initialization artifacts before the scene has
+    developed a meaningful support distribution.
+    """
+
+    min_backfill_support_score: float = 0.05
+    """Minimum support score for a Gaussian to be eligible as a backfill parent."""
+
+    min_backfill_opacity: float = 0.01
+    """Minimum post-sigmoid opacity for a Gaussian to be eligible as a backfill parent."""
+
+    backfill_extent: Optional[float] = None
+    """Optional full random/pruning-box extent used to reject edge-of-box parents.
+
+    If None, this falls back to prune_outside_extent. Passing the model's
+    random_scale here is recommended if you want min-Gaussian backfill to avoid
+    the random box boundary even when prune_outside_random_scale_box is disabled.
+    """
+
+    backfill_edge_margin_frac: float = 0.15
+    """Fractional margin removed from the backfill candidate box.
+
+    Example:
+        If backfill_extent = 0.2, the full box is roughly [-0.1, 0.1].
+        With backfill_edge_margin_frac = 0.15, candidates must lie within
+        [-0.085, 0.085] along every axis.
+    """
+
+    backfill_use_supported_cloud: bool = True
+    """If True, localize backfill parents to the robust supported Gaussian cloud."""
+
+    backfill_cloud_quantile: float = 0.80
+    """Quantile of supported-cloud distances used as the robust object-core radius."""
+
+    backfill_cloud_radius_scale: float = 1.25
+    """Scale applied to the robust supported-cloud radius for candidate filtering."""
+
+    backfill_min_cloud_points: int = 64
+    """Minimum number of high-support Gaussians required to estimate the supported cloud."""
 
     def initialize_state(self, scene_scale: float = 1.0) -> Dict[str, Any]:
         """Initialize DefaultStrategy state plus persistent support state."""
@@ -96,6 +183,18 @@ class SupportAwareStrategy(DefaultStrategy):
         state["support_last_densify_step"] = -1
         state["support_last_cull_step"] = -1
 
+        # ---------------------------------------------------------------------
+        # MIN-GAUSSIANS ADDITION: diagnostics.
+        # ---------------------------------------------------------------------
+        # These are scalar diagnostics updated whenever _prune_gs runs.
+        # They let you verify whether the min-Gaussian safeguard is actually
+        # doing anything and whether it had a usable localized parent pool.
+        # ---------------------------------------------------------------------
+        state["support_num_backfilled"] = 0
+        state["support_backfill_candidate_count"] = 0
+        state["support_backfill_needed"] = 0
+        state["support_last_backfill_step"] = -1
+
         return state
 
     @staticmethod
@@ -112,15 +211,7 @@ class SupportAwareStrategy(DefaultStrategy):
 
     @staticmethod
     def _safe_normalize(values: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-        """Robustly normalize a nonnegative per-Gaussian statistic to roughly [0, 1].
-
-        A fixed absolute gradient threshold can be brittle across scenes and
-        rasterization settings. Quantile normalization makes the support score
-        less scene-scale dependent.
-
-        Uses the 95th percentile instead of max so a few extreme Gaussians do
-        not collapse the rest of the scores toward zero.
-        """
+        """Robustly normalize a nonnegative per-Gaussian statistic to roughly [0, 1]."""
         if values.numel() == 0:
             return values
 
@@ -151,8 +242,6 @@ class SupportAwareStrategy(DefaultStrategy):
         """Extract visible Gaussian ids, gradient norms, and radii.
 
         This mirrors DefaultStrategy._update_state's packed/unpacked handling.
-        It intentionally uses the same gradient normalization convention as the
-        default strategy so that support_grad_ema is comparable to grad2d.
         """
         for key in ["width", "height", "n_cameras", "radii", "gaussian_ids", self.key_for_gradient]:
             assert key in info, f"{key} is required but missing."
@@ -188,24 +277,7 @@ class SupportAwareStrategy(DefaultStrategy):
         info: Dict[str, Any],
         packed: bool = False,
     ) -> None:
-        """Update long-horizon multi-view support statistics.
-
-        This is the main addition relative to DefaultStrategy.
-
-        support_count_ema:
-            Whether this Gaussian has repeatedly appeared in the rasterizer.
-
-        support_grad_ema:
-            Whether this Gaussian repeatedly receives image-plane gradients,
-            which is a proxy for usefulness to reconstruction/optimization.
-
-        support_radii_ema:
-            Whether this Gaussian repeatedly occupies nontrivial screen space.
-
-        These values decay every training step, then visible Gaussians get an
-        increment. They should survive the short-window stat reset after each
-        refine event.
-        """
+        """Update long-horizon multi-view support statistics."""
         device = params["means"].device
         self._ensure_support_state(params, state, device)
 
@@ -262,7 +334,6 @@ class SupportAwareStrategy(DefaultStrategy):
         self._update_persistent_support(params, state, info, packed=packed)
 
         # Keep support_score fresh for metrics logging.
-        # Otherwise it only appears after _prune_gs runs, and only after warmup.
         if state.get("support_count_ema", None) is not None:
             state["support_score"] = self._compute_support_score(params, state).detach()
 
@@ -299,6 +370,278 @@ class SupportAwareStrategy(DefaultStrategy):
 
         return score.clamp(0.0, 1.0)
 
+    # -------------------------------------------------------------------------
+    # MIN-GAUSSIANS ADDITION: extent helper.
+    # -------------------------------------------------------------------------
+    # Backfill parent selection needs to know the random/pruning box extent so it
+    # can avoid selecting edge-of-box Gaussians.
+    #
+    # This intentionally separates "backfill_extent" from "prune_outside_extent":
+    #   - prune_outside_extent controls hard outside-box pruning.
+    #   - backfill_extent controls candidate selection for min-Gaussian backfill.
+    #
+    # If you pass random_scale as backfill_extent from Splatfacto, the backfill
+    # logic can avoid random-box edges even if prune_outside_random_scale_box is
+    # disabled.
+    # -------------------------------------------------------------------------
+    def _effective_backfill_extent(self) -> Optional[float]:
+        if self.backfill_extent is not None:
+            return float(self.backfill_extent)
+        if self.prune_outside_extent is not None:
+            return float(self.prune_outside_extent)
+        return None
+
+    # -------------------------------------------------------------------------
+    # MIN-GAUSSIANS ADDITION: estimate supported object cloud.
+    # -------------------------------------------------------------------------
+    # This replaces the mesh-aware notion of "inside the mesh" with an inferred
+    # object-support prior. High-support, non-transparent Gaussians define a
+    # weighted center and robust radius. Backfill parents can then be restricted
+    # to the region around this supported cloud.
+    # -------------------------------------------------------------------------
+    @torch.no_grad()
+    def _supported_cloud_geometry(
+        self,
+        params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+        support_score: torch.Tensor,
+        opac: torch.Tensor,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Estimate a mesh-free object core from supported Gaussian locations."""
+        means = params["means"].detach()
+
+        support_mask = support_score >= self.min_backfill_support_score
+        support_mask = support_mask & (opac >= self.min_backfill_opacity)
+
+        if int(support_mask.sum().item()) < int(self.backfill_min_cloud_points):
+            return None, None
+
+        support_means = means[support_mask]
+        weights = (support_score[support_mask] * opac[support_mask]).clamp_min(1e-6)
+
+        center = (support_means * weights[:, None]).sum(dim=0) / weights.sum().clamp_min(1e-6)
+
+        dists = torch.linalg.norm(support_means - center[None, :], dim=-1)
+        radius = torch.quantile(dists, float(self.backfill_cloud_quantile)).clamp_min(1e-6)
+
+        return center, radius
+
+    # -------------------------------------------------------------------------
+    # MIN-GAUSSIANS ADDITION: localized candidate mask.
+    # -------------------------------------------------------------------------
+    # This builds the parent pool used for backfill. It deliberately excludes:
+    #   - Gaussians already marked for pruning,
+    #   - weakly supported Gaussians,
+    #   - nearly transparent Gaussians,
+    #   - Gaussians near the random/pruning box edge,
+    #   - Gaussians far from the robust supported cloud.
+    # -------------------------------------------------------------------------
+    @torch.no_grad()
+    def _support_backfill_candidate_mask(
+        self,
+        params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+        prune_mask: torch.Tensor,
+        support_score: torch.Tensor,
+        opac: torch.Tensor,
+    ) -> torch.Tensor:
+        """Build a localized candidate pool for min-Gaussian backfilling."""
+        means = params["means"].detach()
+
+        candidate_mask = ~prune_mask
+        candidate_mask &= support_score >= self.min_backfill_support_score
+        candidate_mask &= opac >= self.min_backfill_opacity
+
+        # Reject candidates near the random/pruning box edge.
+        extent = self._effective_backfill_extent()
+        if extent is not None and self.backfill_edge_margin_frac > 0.0:
+            half_extent = 0.5 * float(extent)
+            core_half_extent = half_extent * (1.0 - float(self.backfill_edge_margin_frac))
+            inside_core_extent = (means.abs() <= core_half_extent).all(dim=-1)
+            candidate_mask &= inside_core_extent
+
+        # Localize to the supported Gaussian cloud.
+        if self.backfill_use_supported_cloud:
+            center, radius = self._supported_cloud_geometry(params, support_score, opac)
+            if center is not None and radius is not None:
+                dists = torch.linalg.norm(means - center[None, :], dim=-1)
+                candidate_mask &= dists <= float(self.backfill_cloud_radius_scale) * radius
+
+        return candidate_mask
+
+    # -------------------------------------------------------------------------
+    # MIN-GAUSSIANS ADDITION: choose backfill parents.
+    # -------------------------------------------------------------------------
+    # Parents are selected from the localized candidate pool. The score prefers:
+    #   - high support score,
+    #   - high opacity,
+    #   - high persistent count support,
+    #   - high persistent gradient support,
+    #   - small distance from supported-cloud center,
+    #   - small distance from random/pruning box edge.
+    # -------------------------------------------------------------------------
+    @torch.no_grad()
+    def _select_support_backfill_parents(
+        self,
+        params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+        state: Dict[str, Any],
+        candidate_mask: torch.Tensor,
+        support_score: torch.Tensor,
+        opac: torch.Tensor,
+        n_needed: int,
+    ) -> torch.Tensor:
+        """Select parent Gaussians for min-Gaussian backfill."""
+        if n_needed <= 0:
+            return torch.empty(0, dtype=torch.long, device=candidate_mask.device)
+
+        if not torch.any(candidate_mask):
+            return torch.empty(0, dtype=torch.long, device=candidate_mask.device)
+
+        means = params["means"].detach()
+        pool = torch.where(candidate_mask)[0]
+
+        count = state.get("support_count_ema", None)
+        grad = state.get("support_grad_ema", None)
+
+        if isinstance(count, torch.Tensor):
+            count = self._align_length(count, means.shape[0], fill_value=0.0)
+            count_n = self._safe_normalize(count)
+        else:
+            count_n = torch.zeros_like(support_score)
+
+        if isinstance(grad, torch.Tensor):
+            grad = self._align_length(grad, means.shape[0], fill_value=0.0)
+            grad_n = self._safe_normalize(grad)
+        else:
+            grad_n = torch.zeros_like(support_score)
+
+        # Centrality penalty relative to the supported cloud.
+        dist_penalty = torch.zeros_like(support_score)
+        center, radius = self._supported_cloud_geometry(params, support_score, opac)
+        if center is not None and radius is not None:
+            denom = (float(self.backfill_cloud_radius_scale) * radius).clamp_min(1e-6)
+            dists = torch.linalg.norm(means - center[None, :], dim=-1)
+            dist_penalty = (dists / denom).clamp(0.0, 1.0)
+
+        # Edge penalty relative to the random/pruning box.
+        edge_penalty = torch.zeros_like(support_score)
+        extent = self._effective_backfill_extent()
+        if extent is not None:
+            half_extent = 0.5 * float(extent)
+            if half_extent > 0.0:
+                edge_penalty = (means.abs().amax(dim=-1) / half_extent).clamp(0.0, 1.0)
+
+        scores = (
+            1.5 * support_score[pool]
+            + 0.75 * opac[pool]
+            + 0.25 * count_n[pool]
+            + 0.25 * grad_n[pool]
+            - 0.5 * dist_penalty[pool]
+            - 0.5 * edge_penalty[pool]
+        ).clamp_min(1e-6)
+
+        # Prefer top unique parents first.
+        unique_take = min(int(n_needed), int(pool.numel()))
+        selected = torch.empty(0, dtype=torch.long, device=pool.device)
+
+        if unique_take > 0:
+            selected = pool[torch.topk(scores, k=unique_take, sorted=False).indices]
+
+        remaining = int(n_needed) - int(selected.numel())
+        if remaining <= 0:
+            return selected
+
+        # If more Gaussians are needed than unique candidates, sample with replacement.
+        sampled_local = torch.multinomial(scores, remaining, replacement=True)
+        return torch.cat([selected, pool[sampled_local]], dim=0)
+
+    # -------------------------------------------------------------------------
+    # MIN-GAUSSIANS ADDITION: backfill implementation.
+    # -------------------------------------------------------------------------
+    # If pruning would leave fewer than min_gaussians, duplicate selected parents
+    # from the localized object-core candidate pool before removing the marked
+    # Gaussians.
+    # -------------------------------------------------------------------------
+    @torch.no_grad()
+    def _backfill_min_gaussians(
+        self,
+        params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+        optimizers: Dict[str, torch.optim.Optimizer],
+        state: Dict[str, Any],
+        step: int,
+        prune_mask: torch.Tensor,
+        weak_prune: torch.Tensor,
+        big_prune: torch.Tensor,
+        outside_prune: torch.Tensor,
+        support_score: torch.Tensor,
+        opac: torch.Tensor,
+    ) -> int:
+        """Backfill if pruning would drop the model below min_gaussians."""
+        state["support_num_backfilled"] = 0
+        state["support_backfill_candidate_count"] = 0
+        state["support_backfill_needed"] = 0
+
+        if self.min_gaussians <= 0:
+            return 0
+
+        if step < self.min_gaussians_start_step:
+            return 0
+
+        any_pruned = bool(torch.any(prune_mask))
+        weak_pruned = bool(torch.any(prune_mask & weak_prune))
+        big_pruned = bool(torch.any(prune_mask & big_prune))
+        outside_pruned = bool(torch.any(prune_mask & outside_prune))
+
+        if self.min_gaussians_mode == "weak_only":
+            should_backfill = weak_pruned
+        elif self.min_gaussians_mode == "weak_or_big":
+            should_backfill = weak_pruned or big_pruned
+        elif self.min_gaussians_mode == "always":
+            should_backfill = any_pruned
+        else:
+            raise ValueError(f"Unknown min_gaussians_mode: {self.min_gaussians_mode}")
+
+        if not should_backfill:
+            return 0
+
+        # If outside pruning is the only reason and the mode is not "always",
+        # do not refill the box just because out-of-extent junk was removed.
+        if outside_pruned and not (weak_pruned or big_pruned) and self.min_gaussians_mode != "always":
+            return 0
+
+        n_survivors = int(prune_mask.numel() - prune_mask.sum().item())
+        n_needed = int(self.min_gaussians - n_survivors)
+        state["support_backfill_needed"] = max(n_needed, 0)
+
+        if n_needed <= 0:
+            return 0
+
+        candidate_mask = self._support_backfill_candidate_mask(
+            params=params,
+            prune_mask=prune_mask,
+            support_score=support_score,
+            opac=opac,
+        )
+        state["support_backfill_candidate_count"] = int(candidate_mask.sum().item())
+
+        selected = self._select_support_backfill_parents(
+            params=params,
+            state=state,
+            candidate_mask=candidate_mask,
+            support_score=support_score,
+            opac=opac,
+            n_needed=n_needed,
+        )
+
+        if selected.numel() == 0:
+            return 0
+
+        duplicate_selected(params=params, optimizers=optimizers, state=state, sel=selected)
+
+        n_backfilled = int(selected.numel())
+        state["support_num_backfilled"] = n_backfilled
+        state["support_last_backfill_step"] = int(step)
+
+        return n_backfilled
+
     @torch.no_grad()
     def _grow_gs(
         self,
@@ -307,12 +650,7 @@ class SupportAwareStrategy(DefaultStrategy):
         state: Dict[str, Any],
         step: int,
     ) -> Tuple[int, int]:
-        """DefaultStrategy growth copied here only to keep this file self-contained.
-
-        You could omit this method and inherit DefaultStrategy._grow_gs directly.
-        I am including it so the support-aware strategy remains easy to customize
-        later if you want support-aware growth.
-        """
+        """DefaultStrategy growth with optional support-eased densification."""
         count = state["count"]
         grads = state["grad2d"] / count.clamp_min(1)
         device = grads.device
@@ -416,16 +754,7 @@ class SupportAwareStrategy(DefaultStrategy):
         state: Dict[str, Any],
         step: int,
     ) -> int:
-        """Support-aware pruning.
-
-        This is the main behavioral change.
-
-        Low opacity does not automatically mean prune. A low-opacity Gaussian is
-        pruned only if it also has weak persistent multi-view support.
-
-        Scale-based pruning and outside-extent pruning are preserved, because
-        they target different failure modes than shadowed/dark useful geometry.
-        """
+        """Support-aware pruning with optional support-localized min-Gaussian backfill."""
         opac = torch.sigmoid(params["opacities"].flatten())
         n_gaussian = opac.shape[0]
 
@@ -473,6 +802,29 @@ class SupportAwareStrategy(DefaultStrategy):
         big_only_prune = big_prune & ~outside_prune & ~weak_prune
         is_prune = outside_prune | weak_only_prune | big_only_prune
 
+        # ---------------------------------------------------------------------
+        # MIN-GAUSSIANS ADDITION: backfill before remove().
+        # ---------------------------------------------------------------------
+        # Backfilling must happen before remove() because the parents still exist.
+        # duplicate_selected() appends new Gaussians to params/state. Because
+        # is_prune was computed before appending, it must be padded with False
+        # so newly backfilled Gaussians are not immediately removed.
+        # ---------------------------------------------------------------------
+        n_backfill = self._backfill_min_gaussians(
+            params=params,
+            optimizers=optimizers,
+            state=state,
+            step=step,
+            prune_mask=is_prune,
+            weak_prune=weak_only_prune,
+            big_prune=big_only_prune,
+            outside_prune=outside_prune,
+            support_score=support_score,
+            opac=opac,
+        )
+        if n_backfill > 0:
+            is_prune = self._align_length(is_prune, len(params["means"]), fill_value=False)
+
         n_prune = int(is_prune.sum().item())
         state["support_num_weak_pruned"] = int(weak_only_prune.sum().item())
         state["support_num_big_pruned"] = int(big_only_prune.sum().item())
@@ -488,6 +840,9 @@ class SupportAwareStrategy(DefaultStrategy):
                 f"weak_pruned={state['support_num_weak_pruned']}, "
                 f"big_pruned={state['support_num_big_pruned']}, "
                 f"outside_extent_pruned={state['support_num_outside_extent_pruned']}, "
+                f"backfilled={state['support_num_backfilled']}, "
+                f"backfill_needed={state['support_backfill_needed']}, "
+                f"backfill_candidates={state['support_backfill_candidate_count']}, "
                 f"total_pruned={n_prune}"
             )
 
