@@ -53,6 +53,8 @@ def rasterization(
     n_total_gaussians: Optional[int] = None,
     shadow_alpha_threshold: float = 1.0 / 1024.0,
     shadow_depth_group_eps: float = 0.0,
+    use_shadow_receiver_bias: bool = False,
+    shadow_receiver_bias: Optional[Tensor] = None,
     shadow_return_images: bool = False,
 ) -> Tuple[Tensor, Tensor, Dict]:
     """Rasterize a set of 3D Gaussians (N) to a batch of image planes (C).
@@ -602,10 +604,14 @@ def rasterization(
     shadow_vis_i = None
     shadow_occ_i = None
     shadow_seen_i = None
-
+    
     if shadow_mode:
         assert packed, "shadow_mode currently expects packed=True"
         assert n_total_gaussians is not None, "Need n_total_gaussians in shadow_mode"
+        if use_shadow_receiver_bias:
+            assert shadow_receiver_bias is not None, "shadow_receiver_bias is required when enabled."
+            assert shadow_receiver_bias.shape == (n_total_gaussians,), shadow_receiver_bias.shape
+            shadow_receiver_bias = shadow_receiver_bias.to(device=device, dtype=torch.float32).contiguous()
         if shadow_return_images:
             raise ValueError("shadow_mode is metadata-only; light-view image outputs are temporarily deprecated")
 
@@ -627,6 +633,9 @@ def rasterization(
             packed=packed,
             shadow_alpha_threshold=shadow_alpha_threshold,
             shadow_depth_group_eps=shadow_depth_group_eps,
+            # receiver-bias shadow splatting
+            use_shadow_receiver_bias=use_shadow_receiver_bias,
+            shadow_receiver_bias=shadow_receiver_bias,
         )
         render_colors = torch.empty((0,), device=device, dtype=torch.float32)
         render_alphas = torch.empty((0,), device=device, dtype=torch.float32)
