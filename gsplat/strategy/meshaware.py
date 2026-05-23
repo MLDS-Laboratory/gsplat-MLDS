@@ -18,6 +18,8 @@ class MeshAwareStrategy(DefaultStrategy):
     use_mesh_pruning: bool = True
     protect_boundary: bool = True
     boundary_grow_grad_scale: float = 1.0  # OPTIONAL: set < 1.0 to densify boundary-shell Gaussians more easily
+    mesh_cull_every: int = 0
+    mesh_verbose: bool = True
     min_gaussians: int = 0
     min_gaussians_mode: Literal["outside_only", "outside_or_big", "always"] = "outside_only"
 
@@ -85,6 +87,12 @@ class MeshAwareStrategy(DefaultStrategy):
                 state["radii"].zero_()
             torch.cuda.empty_cache()
 
+        should_mesh_cull = (
+            step > self.refine_start_iter and self.mesh_cull_every > 0 and step % self.mesh_cull_every == 0
+        )
+        if should_mesh_cull:
+            self._prune_outside_mesh_on_reset_step(params, optimizers, state, step, info)
+
         if step % self.reset_every == 0:
             reset_opa(
                 params=params,
@@ -92,6 +100,99 @@ class MeshAwareStrategy(DefaultStrategy):
                 state=state,
                 value=self.prune_opa * 2.0,
             )
+
+    @torch.no_grad()
+    def _prune_outside_mesh_on_reset_step(
+        self,
+        params,
+        optimizers,
+        state,
+        step: int,
+        info: Dict[str, Any],
+    ) -> int:
+        if not (self.use_mesh_pruning and "mesh_outside_mask" in info):
+            return 0
+
+        target_len = params["opacities"].shape[0]
+        outside_mask = self._align_length(info["mesh_outside_mask"], target_len, fill_value=False)
+        if not torch.any(outside_mask):
+            return 0
+
+        inside_mask = self._align_length(
+            info.get("mesh_inside_mask", torch.zeros_like(outside_mask)),
+            target_len,
+            fill_value=False,
+        )
+        boundary_mask = self._align_length(
+            info.get("mesh_boundary_mask", torch.zeros_like(outside_mask)),
+            target_len,
+            fill_value=False,
+        )
+
+        is_prune = outside_mask.clone()
+        n_backfill = self._backfill_min_gaussians(
+            params=params,
+            optimizers=optimizers,
+            state=state,
+            step=step,
+            info=info,
+            prune_mask=is_prune,
+            outside_mask=outside_mask,
+            inside_mask=inside_mask,
+            boundary_mask=boundary_mask,
+            weak_prune=torch.zeros_like(outside_mask),
+            big_prune=torch.zeros_like(outside_mask),
+        )
+        if n_backfill > 0:
+            is_prune = torch.cat(
+                [is_prune, torch.zeros(n_backfill, dtype=torch.bool, device=is_prune.device)],
+                dim=0,
+            )
+
+        n_prune = int(is_prune.sum().item())
+        if n_prune == 0:
+            return 0
+
+        same_step = int(state.get("mesh_last_cull_step", -1)) == int(step)
+        base_low_opacity = int(state.get("mesh_num_low_opacity", 0)) if same_step else 0
+        base_weak = int(state.get("mesh_num_weak_pruned", 0)) if same_step else 0
+        base_big = int(state.get("mesh_num_big_pruned", 0)) if same_step else 0
+        base_outside_mesh = int(state.get("mesh_num_outside_mesh_pruned", 0)) if same_step else 0
+        base_outside_extent = int(state.get("mesh_num_outside_extent_pruned", 0)) if same_step else 0
+        base_total = int(state.get("mesh_num_total_pruned", 0)) if same_step else 0
+        base_inside_protected = int(state.get("mesh_num_inside_protected", 0)) if same_step else 0
+        base_boundary_protected = int(state.get("mesh_num_boundary_protected", 0)) if same_step else 0
+        base_backfilled = int(state.get("mesh_num_backfilled", 0)) if same_step else 0
+        base_backfill_needed = int(state.get("mesh_backfill_needed", 0)) if same_step else 0
+        base_backfill_candidates = int(state.get("mesh_backfill_candidate_count", 0)) if same_step else 0
+        current_backfill_needed = int(state.get("mesh_backfill_needed", 0))
+
+        state["mesh_num_low_opacity"] = base_low_opacity
+        state["mesh_num_weak_pruned"] = base_weak
+        state["mesh_num_big_pruned"] = base_big
+        state["mesh_num_outside_mesh_pruned"] = base_outside_mesh + n_prune
+        state["mesh_num_outside_extent_pruned"] = base_outside_extent
+        state["mesh_num_total_pruned"] = base_total + n_prune
+        state["mesh_num_inside_protected"] = base_inside_protected
+        state["mesh_num_boundary_protected"] = base_boundary_protected
+        state["mesh_num_backfilled"] = base_backfilled + int(n_backfill)
+        state["mesh_backfill_candidate_count"] = base_backfill_candidates + int(
+            state.get("mesh_backfill_candidate_count", 0)
+        )
+        state["mesh_backfill_needed"] = base_backfill_needed + current_backfill_needed
+        if n_backfill > 0:
+            state["mesh_last_backfill_step"] = int(step)
+        state["mesh_last_cull_step"] = int(step)
+        state["mesh_debug"] = {
+            **(state.get("mesh_debug", {}) if isinstance(state.get("mesh_debug", {}), dict) else {}),
+            "outside_mesh_reset_cull_step": int(step),
+            "outside_mesh_reset_pruned_count": int(n_prune),
+            "outside_mesh_reset_backfill_count": int(n_backfill),
+        }
+
+        self._log_mesh_prune_diagnostics(state, step, source="mesh_cull")
+        remove(params=params, optimizers=optimizers, state=state, mask=is_prune)
+        return n_prune
 
     @torch.no_grad()
     def _grow_gs(
@@ -307,7 +408,7 @@ class MeshAwareStrategy(DefaultStrategy):
             else:
                 raise ValueError(f"Unknown BIG_GAUSSIAN_PROTECTION_MODE: {BIG_GAUSSIAN_PROTECTION_MODE}")
 
-            is_prune = outside_mask | (weak_prune & ~weak_protected_mask) | (big_prune & ~big_protected_mask)
+            is_prune = (weak_prune & ~weak_protected_mask) | (big_prune & ~big_protected_mask)
 
             n_backfill = self._backfill_min_gaussians(
                 params=params,
