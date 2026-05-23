@@ -6,7 +6,7 @@ from typing import Any, Dict, Literal, Optional, Tuple, Union
 import torch
 
 from .default import DefaultStrategy
-from .ops import duplicate, duplicate_selected, remove, split
+from .ops import duplicate, duplicate_selected, remove, reset_opa, split
 
 
 @dataclass
@@ -67,6 +67,24 @@ class SupportAwareStrategy(DefaultStrategy):
     # Before this many steps, use default opacity pruning.
     # This avoids protecting random early Gaussians before the field has settled.
     support_warmup_steps: int = 1000
+
+    # -------------------------------------------------------------------------
+    # RANDOM-BOX WARM-START ADDITION.
+    # -------------------------------------------------------------------------
+    # When Gaussians begin from a random box instead of COLMAP/SfM support,
+    # early support statistics are unreliable. This staged warm-start keeps
+    # Gaussians alive long enough for photometric gradients and a foreground
+    # opacity prior to pull them toward the object before normal pruning starts.
+    # -------------------------------------------------------------------------
+
+    use_support_warmstart: bool = False
+    support_warmstart_steps: int = 1000
+    support_warmstart_decay_steps: int = 1000
+    support_warmstart_disable_culling: bool = True
+    support_warmstart_disable_densification: bool = True
+    support_warmstart_means_only_optimization: bool = False
+    support_warmstart_conservative_culling_steps: int = 1000
+    support_warmstart_conservative_cull_alpha_scale: float = 0.5
 
     # Usually False. Big-scale pruning targets a different failure mode than
     # weak opacity pruning, so support should not protect big splats by default.
@@ -196,6 +214,118 @@ class SupportAwareStrategy(DefaultStrategy):
         state["support_last_backfill_step"] = -1
 
         return state
+
+    # added for the warm-start
+    def _in_support_warmstart(self, step: int) -> bool:
+        return bool(self.use_support_warmstart) and step < int(self.support_warmstart_steps)
+
+    def _in_conservative_culling(self, step: int) -> bool:
+        if not self.use_support_warmstart:
+            return False
+        start = int(self.support_warmstart_steps)
+        stop = start + int(self.support_warmstart_conservative_culling_steps)
+        return start <= step < stop
+
+    def _support_ready_step(self) -> int:
+        if not self.use_support_warmstart:
+            return int(self.support_warmup_steps)
+        return min(int(self.support_warmup_steps), int(self.support_warmstart_steps))
+
+    def _means_only_warmstart_active(self, step: int) -> bool:
+        return self._in_support_warmstart(step) and bool(self.support_warmstart_means_only_optimization)
+
+    def _warmstart_decay_support_score_scale(self, step: int) -> float:
+        if not self.use_support_warmstart:
+            return 1.0
+        start = int(self.support_warmstart_steps)
+        decay_steps = max(1, int(self.support_warmstart_decay_steps))
+        if step < start:
+            return 1.0
+        if step >= start + decay_steps:
+            return 1.0
+        frac = float(step - start) / float(decay_steps)
+        return 0.1 + 0.9 * frac
+
+    @staticmethod
+    def _reset_densify_diagnostics(state: Dict[str, Any]) -> None:
+        state["support_num_duplicated"] = 0
+        state["support_num_split"] = 0
+        state["support_num_densified"] = 0
+        state["support_num_support_eased_duplicated"] = 0
+        state["support_num_support_eased_split"] = 0
+        state["support_num_support_eased_densified"] = 0
+
+    @staticmethod
+    def _reset_cull_diagnostics(state: Dict[str, Any]) -> None:
+        state["support_num_low_opacity"] = 0
+        state["support_num_protected"] = 0
+        state["support_num_weak_pruned"] = 0
+        state["support_num_big_pruned"] = 0
+        state["support_num_outside_extent_pruned"] = 0
+        state["support_num_total_pruned"] = 0
+        state["support_num_backfilled"] = 0
+        state["support_backfill_candidate_count"] = 0
+        state["support_backfill_needed"] = 0
+
+    def step_post_backward(
+        self,
+        params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+        optimizers: Dict[str, torch.optim.Optimizer],
+        state: Dict[str, Any],
+        step: int,
+        info: Dict[str, Any],
+        packed: bool = False,
+    ):
+        """Refinement step with optional support warm-start gating for random-box init."""
+        if step >= self.refine_stop_iter:
+            return
+
+        state["support_num_pruned_this_step"] = 0
+        self._update_state(params, state, info, packed=packed)
+
+        if (
+            step > self.refine_start_iter
+            and step % self.refine_every == 0
+            and step % self.reset_every >= self.pause_refine_after_reset
+        ):
+            in_warmstart = self._in_support_warmstart(step)
+            means_only_warmstart = self._means_only_warmstart_active(step)
+            skip_densify = in_warmstart and (self.support_warmstart_disable_densification or means_only_warmstart)
+            skip_cull = in_warmstart and (self.support_warmstart_disable_culling or means_only_warmstart)
+
+            if skip_densify:
+                self._reset_densify_diagnostics(state)
+                n_dupli, n_split = 0, 0
+            else:
+                n_dupli, n_split = self._grow_gs(params, optimizers, state, step)
+                if self.verbose:
+                    print(
+                        f"Step {step}: {n_dupli} GSs duplicated, {n_split} GSs split. "
+                        f"Now having {len(params['means'])} GSs."
+                    )
+
+            if skip_cull:
+                self._reset_cull_diagnostics(state)
+                n_prune = 0
+            else:
+                n_prune = self._prune_gs(params, optimizers, state, step)
+                if self.verbose:
+                    print(f"Step {step}: {n_prune} GSs pruned. Now having {len(params['means'])} GSs.")
+            state["support_num_pruned_this_step"] = int(n_prune)
+
+            state["grad2d"].zero_()
+            state["count"].zero_()
+            if self.refine_scale2d_stop_iter > 0:
+                state["radii"].zero_()
+            torch.cuda.empty_cache()
+
+        if step % self.reset_every == 0 and not self._means_only_warmstart_active(step):
+            reset_opa(
+                params=params,
+                optimizers=optimizers,
+                state=state,
+                value=self.prune_opa * 2.0,
+            )
 
     @staticmethod
     def _align_length(values: torch.Tensor, target_len: int, fill_value: float | bool = 0.0) -> torch.Tensor:
@@ -658,7 +788,7 @@ class SupportAwareStrategy(DefaultStrategy):
         support_eased_mask = torch.zeros_like(grads, dtype=torch.bool)
         grow_thresh = torch.full_like(grads, self.grow_grad2d)
         if (
-            step >= self.support_warmup_steps
+            step >= self._support_ready_step()
             and self.support_densify_grad_scale != 1.0
             and state.get("support_count_ema", None) is not None
         ):
@@ -758,9 +888,16 @@ class SupportAwareStrategy(DefaultStrategy):
         opac = torch.sigmoid(params["opacities"].flatten())
         n_gaussian = opac.shape[0]
 
-        low_opacity = opac < self.prune_opa
+        effective_prune_opa = float(self.prune_opa)
+        effective_support_score_thresh = float(self.support_score_thresh)
+        if self._in_conservative_culling(step):
+            scale = max(float(self.support_warmstart_conservative_cull_alpha_scale), 0.0)
+            effective_prune_opa *= scale
+        effective_support_score_thresh *= self._warmstart_decay_support_score_scale(step)
 
-        if step < self.support_warmup_steps:
+        low_opacity = opac < effective_prune_opa
+
+        if step < self._support_ready_step():
             # Early training can contain many random Gaussians with accidental
             # visibility. During warmup, keep default weak pruning.
             support_score = torch.zeros(n_gaussian, device=opac.device)
@@ -771,7 +908,7 @@ class SupportAwareStrategy(DefaultStrategy):
             support_score = self._compute_support_score(params, state)
             state["support_score"] = support_score.detach()
 
-            support_protected = support_score >= self.support_score_thresh
+            support_protected = support_score >= effective_support_score_thresh
             weak_prune = low_opacity & ~support_protected
 
         # Diagnostics for understanding whether the method is protecting anything.
@@ -792,7 +929,7 @@ class SupportAwareStrategy(DefaultStrategy):
             if step < self.refine_scale2d_stop_iter:
                 big_prune |= state["radii"] > self.prune_scale2d
 
-            if self.support_protect_big and step >= self.support_warmup_steps:
+            if self.support_protect_big and step >= self._support_ready_step():
                 # Optional. Usually leave this False at first.
                 big_prune = big_prune & ~support_protected
 
