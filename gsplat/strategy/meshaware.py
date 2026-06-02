@@ -57,7 +57,8 @@ class MeshAwareStrategy(DefaultStrategy):
         packed: bool = False,
     ):
         """Callback function to be executed after the `loss.backward()` call."""
-        if step >= self.refine_stop_iter:
+        if self._refinement_stopped(step):
+            self._maybe_print_refinement_stopped(state, step)
             return
 
         self._update_state(params, state, info, packed=packed)
@@ -67,8 +68,13 @@ class MeshAwareStrategy(DefaultStrategy):
             and step % self.refine_every == 0
             and step % self.reset_every >= self.pause_refine_after_reset
         ):
+            self._print_refinement_status(step)
+
             # grow GSs
-            n_dupli, n_split = self._grow_gs(params, optimizers, state, step, info)
+            if self._densification_stopped(step):
+                n_dupli, n_split = 0, 0
+            else:
+                n_dupli, n_split = self._grow_gs(params, optimizers, state, step, info)
             if self.verbose:
                 print(
                     f"Step {step}: {n_dupli} GSs duplicated, {n_split} GSs split. "

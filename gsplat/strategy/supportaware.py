@@ -277,7 +277,8 @@ class SupportAwareStrategy(DefaultStrategy):
         packed: bool = False,
     ):
         """Refinement step with optional support warm-start gating for random-box init."""
-        if step >= self.refine_stop_iter:
+        if self._refinement_stopped(step):
+            self._maybe_print_refinement_stopped(state, step)
             return
 
         state["support_num_pruned_this_step"] = 0
@@ -288,21 +289,22 @@ class SupportAwareStrategy(DefaultStrategy):
             and step % self.refine_every == 0
             and step % self.reset_every >= self.pause_refine_after_reset
         ):
+            self._print_refinement_status(step)
             in_warmstart = self._in_support_warmstart(step)
             means_only_warmstart = self._means_only_warmstart_active(step)
             skip_densify = in_warmstart and (self.support_warmstart_disable_densification or means_only_warmstart)
             skip_cull = in_warmstart and (self.support_warmstart_disable_culling or means_only_warmstart)
 
-            if skip_densify:
+            if skip_densify or self._densification_stopped(step):
                 self._reset_densify_diagnostics(state)
                 n_dupli, n_split = 0, 0
             else:
                 n_dupli, n_split = self._grow_gs(params, optimizers, state, step)
-                if self.verbose:
-                    print(
-                        f"Step {step}: {n_dupli} GSs duplicated, {n_split} GSs split. "
-                        f"Now having {len(params['means'])} GSs."
-                    )
+            if self.verbose:
+                print(
+                    f"Step {step}: {n_dupli} GSs duplicated, {n_split} GSs split. "
+                    f"Now having {len(params['means'])} GSs."
+                )
 
             if skip_cull:
                 self._reset_cull_diagnostics(state)
