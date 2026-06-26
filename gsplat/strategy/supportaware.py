@@ -190,6 +190,7 @@ class SupportAwareStrategy(DefaultStrategy):
         state["support_num_big_pruned"] = 0
         state["support_num_outside_extent_pruned"] = 0
         state["support_num_total_pruned"] = 0
+        state["support_num_pruned_this_step"] = 0
 
         # Per-refinement densification diagnostics.
         state["support_num_duplicated"] = 0
@@ -413,17 +414,16 @@ class SupportAwareStrategy(DefaultStrategy):
         device = params["means"].device
         self._ensure_support_state(params, state, device)
 
+        d = float(self.support_ema_decay)
+        one_minus_d = 1.0 - d
+
         gs_ids, grad_norm, radii = self._extract_visible_stats(info, packed=packed)
         if gs_ids.numel() == 0:
             # Still decay the support state slightly if nothing is visible.
-            d = float(self.support_ema_decay)
             state["support_count_ema"].mul_(d)
             state["support_grad_ema"].mul_(d)
             state["support_radii_ema"].mul_(d)
             return
-
-        d = float(self.support_ema_decay)
-        one_minus_d = 1.0 - d
 
         # Decay all Gaussians.
         state["support_count_ema"].mul_(d)
@@ -653,21 +653,12 @@ class SupportAwareStrategy(DefaultStrategy):
             dists = torch.linalg.norm(means - center[None, :], dim=-1)
             dist_penalty = (dists / denom).clamp(0.0, 1.0)
 
-        # Edge penalty relative to the random/pruning box.
-        edge_penalty = torch.zeros_like(support_score)
-        extent = self._effective_backfill_extent()
-        if extent is not None:
-            half_extent = 0.5 * float(extent)
-            if half_extent > 0.0:
-                edge_penalty = (means.abs().amax(dim=-1) / half_extent).clamp(0.0, 1.0)
-
         scores = (
             1.5 * support_score[pool]
             + 0.75 * opac[pool]
             + 0.25 * count_n[pool]
             + 0.25 * grad_n[pool]
             - 0.5 * dist_penalty[pool]
-            - 0.5 * edge_penalty[pool]
         ).clamp_min(1e-6)
 
         # Prefer top unique parents first.
