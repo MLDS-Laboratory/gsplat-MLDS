@@ -361,7 +361,7 @@ class SupportAwareStrategy(DefaultStrategy):
         n_gaussian = len(params["means"])
 
         for key in ["support_count_ema", "support_grad_ema", "support_radii_ema"]:
-            if state[key] is None:
+            if state.get(key, None) is None:
                 state[key] = torch.zeros(n_gaussian, device=device)
             else:
                 state[key] = self._align_length(state[key], n_gaussian, fill_value=0.0)

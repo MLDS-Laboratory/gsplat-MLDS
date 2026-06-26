@@ -1,6 +1,6 @@
-import numpy as np
 from typing import Callable, Dict, List, Union
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import Tensor
@@ -8,6 +8,19 @@ from torch import Tensor
 from gsplat import quat_scale_to_covar_preci
 from gsplat.relocation import compute_relocation
 from gsplat.utils import normalized_quat_to_rotmat
+
+SUPPORT_EMA_STATE_KEYS = {
+    "support_count_ema",
+    "support_grad_ema",
+    "support_radii_ema",
+}
+
+
+def _reset_spawned_support_state(state_key: str, spawned_state: Tensor) -> Tensor:
+    # newly spawned children should not inherit the parent's long-horizon support evidence.
+    if state_key in SUPPORT_EMA_STATE_KEYS:
+        return torch.zeros_like(spawned_state)
+    return spawned_state
 
 
 @torch.no_grad()
@@ -35,9 +48,7 @@ def _multinomial_sample(weights: Tensor, n: int, replacement: bool = True) -> Te
         # Fallback to numpy.random.choice for larger element spaces
         weights = weights / weights.sum()
         weights_np = weights.detach().cpu().numpy()
-        sampled_idxs_np = np.random.choice(
-            num_elements, size=n, p=weights_np, replace=replacement
-        )
+        sampled_idxs_np = np.random.choice(num_elements, size=n, p=weights_np, replace=replacement)
         sampled_idxs = torch.from_numpy(sampled_idxs_np)
 
         # Return the sampled indices on the original device
@@ -111,7 +122,8 @@ def duplicate(
     # update the extra running state
     for k, v in state.items():
         if isinstance(v, torch.Tensor):
-            state[k] = torch.cat((v, v[sel]))
+            spawned_state = _reset_spawned_support_state(k, v[sel])
+            state[k] = torch.cat((v, spawned_state))
 
 
 @torch.no_grad()
@@ -146,7 +158,8 @@ def duplicate_selected(
     _update_param_with_optimizer(param_fn, optimizer_fn, params, optimizers)
     for k, v in state.items():
         if isinstance(v, torch.Tensor):
-            state[k] = torch.cat((v, v[sel]), dim=0)
+            spawned_state = _reset_spawned_support_state(k, v[sel])
+            state[k] = torch.cat((v, spawned_state), dim=0)
 
 
 @torch.no_grad()
@@ -205,7 +218,7 @@ def split(
     for k, v in state.items():
         if isinstance(v, torch.Tensor):
             repeats = [2] + [1] * (v.dim() - 1)
-            v_new = v[sel].repeat(repeats)
+            v_new = _reset_spawned_support_state(k, v[sel].repeat(repeats))
             state[k] = torch.cat((v[rest], v_new))
 
 
@@ -265,9 +278,7 @@ def reset_opa(
         return torch.zeros_like(v)
 
     # update the parameters and the state in the optimizers
-    _update_param_with_optimizer(
-        param_fn, optimizer_fn, params, optimizers, names=["opacities"]
-    )
+    _update_param_with_optimizer(param_fn, optimizer_fn, params, optimizers, names=["opacities"])
 
 
 @torch.no_grad()
@@ -389,10 +400,6 @@ def inject_noise_to_position(
     def op_sigmoid(x, k=100, x0=0.995):
         return 1 / (1 + torch.exp(-k * (x - x0)))
 
-    noise = (
-        torch.randn_like(params["means"])
-        * (op_sigmoid(1 - opacities)).unsqueeze(-1)
-        * scaler
-    )
+    noise = torch.randn_like(params["means"]) * (op_sigmoid(1 - opacities)).unsqueeze(-1) * scaler
     noise = torch.einsum("bij,bj->bi", covars, noise)
     params["means"].add_(noise)
