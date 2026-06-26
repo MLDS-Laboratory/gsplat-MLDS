@@ -363,7 +363,27 @@ class MeshAwareStrategy(DefaultStrategy):
             return 0
 
         duplicate_selected(params=params, optimizers=optimizers, state=state, sel=selected)
-        return int(selected.numel())
+    def _mesh_inside_protection_masks(self, state: Dict[str, Any], step: int, info: Dict[str, Any], target_len: int):
+        inside_mask = self._align_length(
+            info.get("mesh_inside_mask", torch.zeros(target_len, dtype=torch.bool, device=state["count"].device)),
+            target_len,
+            fill_value=False,
+        )
+        boundary_mask = self._align_length(
+            info.get("mesh_boundary_mask", torch.zeros_like(inside_mask)),
+            target_len,
+            fill_value=False,
+        )
+        deep_inside = inside_mask & ~boundary_mask
+        near_surface_protected = torch.zeros_like(inside_mask)
+
+        if self.protect_boundary:
+            near_surface_protected = near_surface_protected | boundary_mask
+
+        inside_protected = near_surface_protected.clone()
+        inside_protected |= deep_inside
+
+        return inside_protected, boundary_mask, deep_inside
 
     @torch.no_grad()
     def _prune_gs(
@@ -391,21 +411,18 @@ class MeshAwareStrategy(DefaultStrategy):
                 target_len,
                 fill_value=False,
             )
-            boundary_mask = self._align_length(
-                info.get("mesh_boundary_mask", torch.zeros_like(outside_mask)),
-                target_len,
-                fill_value=False,
+            inside_protected_mask, boundary_mask, deep_inside_mask = self._mesh_inside_protection_masks(
+                state=state,
+                step=step,
+                info=info,
+                target_len=target_len,
             )
 
-            weak_protected_mask = inside_mask
-            if self.protect_boundary:
-                weak_protected_mask = weak_protected_mask | boundary_mask
+            weak_protected_mask = inside_protected_mask
 
             big_protected_mask = torch.zeros_like(inside_mask)
             if BIG_GAUSSIAN_PROTECTION_MODE == "inside_and_boundary":
-                big_protected_mask = big_protected_mask | inside_mask
-                if self.protect_boundary:
-                    big_protected_mask = big_protected_mask | boundary_mask
+                big_protected_mask = big_protected_mask | inside_protected_mask
             elif BIG_GAUSSIAN_PROTECTION_MODE == "boundary_only":
                 if self.protect_boundary:
                     big_protected_mask = big_protected_mask | boundary_mask
