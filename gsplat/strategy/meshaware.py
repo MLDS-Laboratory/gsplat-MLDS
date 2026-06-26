@@ -107,6 +107,32 @@ class MeshAwareStrategy(DefaultStrategy):
                 value=self.prune_opa * 2.0,
             )
 
+    def _log_mesh_prune_diagnostics(self, state: Dict[str, Any], step: int, source: str) -> None:
+        if not (self.mesh_verbose and self.verbose):
+            return
+
+        inside_protected = int(state.get("mesh_num_inside_protected", 0))
+        boundary_protected = int(state.get("mesh_num_boundary_protected", 0))
+        total_protected = inside_protected + boundary_protected
+        print(
+            f"MeshAware prune diagnostics ({source}): "
+            f"low_opacity={int(state.get('mesh_num_low_opacity', 0))}, "
+            f"mesh_protected={total_protected}, "
+            f"inside_protected={inside_protected}, "
+            f"boundary_protected={boundary_protected}, "
+            f"deep_inside_contribution_protected={int(state.get('mesh_num_deep_inside_contribution_protected', 0))}, "
+            f"deep_inside_contribution_blocked={int(state.get('mesh_num_deep_inside_contribution_blocked', 0))}, "
+            f"weak_pruned={int(state.get('mesh_num_weak_pruned', 0))}, "
+            f"big_pruned={int(state.get('mesh_num_big_pruned', 0))}, "
+            f"outside_mesh_pruned={int(state.get('mesh_num_outside_mesh_pruned', 0))}, "
+            f"outside_extent_pruned={int(state.get('mesh_num_outside_extent_pruned', 0))}, "
+            f"backfilled={int(state.get('mesh_num_backfilled', 0))}, "
+            f"backfill_needed={int(state.get('mesh_backfill_needed', 0))}, "
+            f"backfill_candidates={int(state.get('mesh_backfill_candidate_count', 0))}, "
+            f"total_pruned={int(state.get('mesh_num_total_pruned', 0))}, "
+            f"step={int(step)}"
+        )
+
     @torch.no_grad()
     def _prune_outside_mesh_on_reset_step(
         self,
@@ -212,9 +238,16 @@ class MeshAwareStrategy(DefaultStrategy):
         count = state["count"]
         grads = state["grad2d"] / count.clamp_min(1)
         device = grads.device
+        scale_max = torch.exp(params["scales"]).max(dim=-1).values.detach()
+        radii_all = (
+            self._align_length(state["radii"], grads.shape[0], fill_value=0.0).detach()
+            if state.get("radii", None) is not None
+            else torch.zeros_like(grads)
+        )
 
         valid_parent = torch.ones_like(grads, dtype=torch.bool)
         boundary_mask = None
+        outside_mask = torch.zeros_like(grads, dtype=torch.bool)
 
         if self.use_mesh_pruning and "mesh_outside_mask" in info:
             outside_mask = self._align_length(info["mesh_outside_mask"], grads.shape[0], fill_value=False)
@@ -231,17 +264,92 @@ class MeshAwareStrategy(DefaultStrategy):
                 grow_thresh,
             )
 
-        is_grad_high = grads > self.grow_grad2d
+        is_grad_high = grads > grow_thresh
         is_small = torch.exp(params["scales"]).max(dim=-1).values <= self.grow_scale3d * state["scene_scale"]
 
         is_dupli = is_grad_high & is_small & valid_parent
-        n_dupli = is_dupli.sum().item()
-
         is_large = ~is_small
         is_split = is_grad_high & is_large & valid_parent
         if step < self.refine_scale2d_stop_iter:
             is_split |= (state["radii"] > self.grow_scale2d) & valid_parent
-        n_split = is_split.sum().item()
+
+        remaining = None if self.cap_max is None else int(self.cap_max) - int(len(params["means"]))
+        if remaining is not None:
+            if remaining <= 0:
+                is_dupli = torch.zeros_like(is_dupli)
+                is_split = torch.zeros_like(is_split)
+            else:
+                dupli_idx = torch.where(is_dupli)[0]
+                split_idx = torch.where(is_split)[0]
+
+                if dupli_idx.numel() + split_idx.numel() > remaining:
+                    scores = grads
+
+                    keep_dupli = min(int(dupli_idx.numel()), remaining)
+                    if dupli_idx.numel() > keep_dupli:
+                        top_dupli = torch.topk(scores[dupli_idx], k=keep_dupli, sorted=False).indices
+                        kept_dupli_idx = dupli_idx[top_dupli]
+                        new_is_dupli = torch.zeros_like(is_dupli)
+                        new_is_dupli[kept_dupli_idx] = True
+                        is_dupli = new_is_dupli
+                        dupli_idx = kept_dupli_idx
+
+                    remaining -= int(dupli_idx.numel())
+                    if remaining <= 0:
+                        is_split = torch.zeros_like(is_split)
+                    elif split_idx.numel() > remaining:
+                        top_split = torch.topk(scores[split_idx], k=remaining, sorted=False).indices
+                        kept_split_idx = split_idx[top_split]
+                        new_is_split = torch.zeros_like(is_split)
+                        new_is_split[kept_split_idx] = True
+                        is_split = new_is_split
+
+        n_dupli = int(is_dupli.sum().item())
+        n_split = int(is_split.sum().item())
+        boundary_mask_for_debug = boundary_mask if boundary_mask is not None else torch.zeros_like(is_dupli)
+        n_boundary_eased_dupli = int((is_dupli & boundary_mask_for_debug).sum().item())
+        n_boundary_eased_split = int((is_split & boundary_mask_for_debug).sum().item())
+
+        # Added from this conversation: mesh-aware densification diagnostics in
+        # a support-aware-like style, but with mesh-specific reason buckets.
+        state["mesh_num_duplicated"] = int(n_dupli)
+        state["mesh_num_split"] = int(n_split)
+        state["mesh_num_densified"] = int(n_dupli + n_split)
+        state["mesh_num_boundary_eased_duplicated"] = n_boundary_eased_dupli
+        state["mesh_num_boundary_eased_split"] = n_boundary_eased_split
+        state["mesh_num_boundary_eased_densified"] = n_boundary_eased_dupli + n_boundary_eased_split
+        state["mesh_last_densify_step"] = int(step)
+        state["mesh_debug"] = {
+            "densify_step": int(step),
+            "outside_mesh_parent_blocked_count": int(outside_mask.sum().item()),
+            "boundary_parent_count": int(boundary_mask_for_debug.sum().item()),
+            "valid_parent_count": int(valid_parent.sum().item()),
+            "grad_high_count": int(is_grad_high.sum().item()),
+            "small_count": int(is_small.sum().item()),
+            "large_count": int(is_large.sum().item()),
+            "duplicate_count": int(n_dupli),
+            "split_count": int(n_split),
+            "densified_count": int(n_dupli + n_split),
+            "boundary_eased_duplicate_count": n_boundary_eased_dupli,
+            "boundary_eased_split_count": n_boundary_eased_split,
+            "boundary_eased_densified_count": n_boundary_eased_dupli + n_boundary_eased_split,
+            "grad2d_all": grads.detach(),
+            "radii_all": radii_all,
+            "scale_max_all": scale_max,
+            "grow_thresh_all": grow_thresh.detach(),
+            "duplicate_grad2d": grads[is_dupli].detach(),
+            "split_grad2d": grads[is_split].detach(),
+            "densified_grad2d": grads[is_dupli | is_split].detach(),
+            "boundary_grad2d": grads[boundary_mask_for_debug].detach(),
+            "duplicate_radii": radii_all[is_dupli].detach(),
+            "split_radii": radii_all[is_split].detach(),
+            "densified_radii": radii_all[is_dupli | is_split].detach(),
+            "boundary_radii": radii_all[boundary_mask_for_debug].detach(),
+            "duplicate_scale_max": scale_max[is_dupli].detach(),
+            "split_scale_max": scale_max[is_split].detach(),
+            "densified_scale_max": scale_max[is_dupli | is_split].detach(),
+            "boundary_scale_max": scale_max[boundary_mask_for_debug].detach(),
+        }
 
         if n_dupli > 0:
             duplicate(params=params, optimizers=optimizers, state=state, mask=is_dupli)
@@ -312,6 +420,7 @@ class MeshAwareStrategy(DefaultStrategy):
         params,
         optimizers,
         state,
+        step: int,
         info: Dict[str, Any],
         prune_mask: torch.Tensor,
         outside_mask: torch.Tensor,
@@ -320,6 +429,10 @@ class MeshAwareStrategy(DefaultStrategy):
         weak_prune: torch.Tensor,
         big_prune: torch.Tensor,
     ) -> int:
+        state["mesh_num_backfilled"] = 0
+        state["mesh_backfill_needed"] = 0
+        state["mesh_backfill_candidate_count"] = 0
+
         if self.min_gaussians <= 0:
             return 0
 
@@ -341,10 +454,12 @@ class MeshAwareStrategy(DefaultStrategy):
 
         n_survivors = int(prune_mask.numel() - prune_mask.sum().item())
         n_needed = int(self.min_gaussians - n_survivors)
+        state["mesh_backfill_needed"] = max(n_needed, 0)
         if n_needed <= 0:
             return 0
 
         candidate_mask = (~prune_mask) & (~outside_mask)
+        state["mesh_backfill_candidate_count"] = int(candidate_mask.sum().item())
         if not torch.any(candidate_mask):
             return 0
 
@@ -363,6 +478,11 @@ class MeshAwareStrategy(DefaultStrategy):
             return 0
 
         duplicate_selected(params=params, optimizers=optimizers, state=state, sel=selected)
+        n_backfilled = int(selected.numel())
+        state["mesh_num_backfilled"] = n_backfilled
+        state["mesh_last_backfill_step"] = int(step)
+        return n_backfilled
+
     def _mesh_inside_protection_masks(self, state: Dict[str, Any], step: int, info: Dict[str, Any], target_len: int):
         inside_mask = self._align_length(
             info.get("mesh_inside_mask", torch.zeros(target_len, dtype=torch.bool, device=state["count"].device)),
@@ -395,8 +515,16 @@ class MeshAwareStrategy(DefaultStrategy):
         info: Dict[str, Any],
     ) -> int:
         opac = torch.sigmoid(params["opacities"].flatten())
+        scale_max = torch.exp(params["scales"]).max(dim=-1).values.detach()
+        radii_all = (
+            self._align_length(state["radii"], opac.shape[0], fill_value=0.0).detach()
+            if state.get("radii", None) is not None
+            else torch.zeros_like(opac)
+        )
+        means_abs_max = params["means"].detach().abs().max(dim=-1).values
 
         weak_prune = opac < self.prune_opa
+        state["mesh_num_low_opacity"] = int(weak_prune.sum().item())
         big_prune = torch.zeros_like(weak_prune)
         if step > self.reset_every:
             big_prune = torch.exp(params["scales"]).max(dim=-1).values > self.prune_scale3d * state["scene_scale"]
@@ -437,6 +565,7 @@ class MeshAwareStrategy(DefaultStrategy):
                 params=params,
                 optimizers=optimizers,
                 state=state,
+                step=step,
                 info=info,
                 prune_mask=is_prune,
                 outside_mask=outside_mask,
@@ -450,15 +579,94 @@ class MeshAwareStrategy(DefaultStrategy):
                     [is_prune, torch.zeros(n_backfill, dtype=torch.bool, device=is_prune.device)],
                     dim=0,
                 )
+            outside_mesh_prune = torch.zeros_like(outside_mask)
+            weak_only_prune = (weak_prune & ~outside_mask) & ~weak_protected_mask
+            big_only_prune = (big_prune & ~outside_mask) & ~big_protected_mask & ~weak_only_prune
+            inside_protected = (inside_protected_mask & ~boundary_mask) & weak_prune
+            boundary_protected = boundary_mask & weak_prune if self.protect_boundary else torch.zeros_like(weak_prune)
         else:
             is_prune = weak_prune | big_prune
+            n_backfill = 0
+            outside_mesh_prune = torch.zeros_like(weak_prune)
+            weak_only_prune = weak_prune
+            big_only_prune = big_prune & ~weak_prune
+            inside_protected = torch.zeros_like(weak_prune)
+            boundary_protected = torch.zeros_like(weak_prune)
+            deep_inside_mask = torch.zeros_like(weak_prune)
 
         # optionally prune Gaussians that leave the random_scale box
         outside_extent_mask = self._prune_outside_extent_mask(params)
         if outside_extent_mask is not None:
             is_prune = is_prune | outside_extent_mask
+        else:
+            outside_extent_mask = torch.zeros_like(weak_prune)
+
+        # Backfilling can append Gaussians mid-prune, so refresh debug tensors and
+        # align any pre-backfill masks before indexing into them below.
+        debug_len = params["opacities"].shape[0]
+        opac = torch.sigmoid(params["opacities"].flatten())
+        scale_max = torch.exp(params["scales"]).max(dim=-1).values.detach()
+        radii_all = (
+            self._align_length(state["radii"], debug_len, fill_value=0.0).detach()
+            if state.get("radii", None) is not None
+            else torch.zeros(debug_len, device=opac.device, dtype=opac.dtype)
+        )
+        means_abs_max = params["means"].detach().abs().max(dim=-1).values
+        weak_only_prune = self._align_length(weak_only_prune, debug_len, fill_value=False)
+        big_only_prune = self._align_length(big_only_prune, debug_len, fill_value=False)
+        outside_mesh_prune = self._align_length(outside_mesh_prune, debug_len, fill_value=False)
+        outside_extent_mask = self._align_length(outside_extent_mask, debug_len, fill_value=False)
+        inside_protected = self._align_length(inside_protected, debug_len, fill_value=False)
+        boundary_protected = self._align_length(boundary_protected, debug_len, fill_value=False)
+        deep_inside_mask = self._align_length(deep_inside_mask, debug_len, fill_value=False)
+        is_prune = self._align_length(is_prune, debug_len, fill_value=False)
 
         n_prune = int(is_prune.sum().item())
+        backfill_needed = max(int(self.min_gaussians - (is_prune.numel() - is_prune.sum().item())), 0)
+        # Added from this conversation: mesh-aware pruning diagnostics to
+        # expose why Gaussians are being removed or preserved on this dataset.
+        state["mesh_num_weak_pruned"] = int(weak_only_prune.sum().item())
+        state["mesh_num_big_pruned"] = int(big_only_prune.sum().item())
+        state["mesh_num_outside_mesh_pruned"] = int(outside_mesh_prune.sum().item())
+        state["mesh_num_outside_extent_pruned"] = int(outside_extent_mask.sum().item())
+        state["mesh_num_total_pruned"] = n_prune
+        state["mesh_num_inside_protected"] = int(inside_protected.sum().item())
+        state["mesh_num_boundary_protected"] = int(boundary_protected.sum().item())
+        state["mesh_num_backfilled"] = int(n_backfill)
+        state["mesh_backfill_needed"] = backfill_needed
+        state["mesh_last_cull_step"] = int(step)
+        state["mesh_debug"] = {
+            **(state.get("mesh_debug", {}) if isinstance(state.get("mesh_debug", {}), dict) else {}),
+            "cull_step": int(step),
+            "weak_pruned_count": int(weak_only_prune.sum().item()),
+            "big_pruned_count": int(big_only_prune.sum().item()),
+            "outside_mesh_pruned_count": int(outside_mesh_prune.sum().item()),
+            "outside_extent_pruned_count": int(outside_extent_mask.sum().item()),
+            "inside_protected_count": int(inside_protected.sum().item()),
+            "boundary_protected_count": int(boundary_protected.sum().item()),
+            "deep_inside_count": int(deep_inside_mask.sum().item()),
+            "final_prune_count": n_prune,
+            "backfill_count": int(n_backfill),
+            "backfill_needed": backfill_needed,
+            "opacity_all": opac.detach(),
+            "radii_all": radii_all,
+            "scale_max_all": scale_max,
+            "means_abs_max_all": means_abs_max.detach(),
+            "weak_pruned_opacity": opac[weak_only_prune].detach(),
+            "big_pruned_opacity": opac[big_only_prune].detach(),
+            "big_pruned_radii": radii_all[big_only_prune].detach(),
+            "big_pruned_scale_max": scale_max[big_only_prune].detach(),
+            "outside_mesh_pruned_opacity": opac[outside_mesh_prune].detach(),
+            "outside_extent_pruned_opacity": opac[outside_extent_mask].detach(),
+            "outside_extent_pruned_abs_extent": means_abs_max[outside_extent_mask].detach(),
+            "inside_protected_opacity": opac[inside_protected].detach(),
+            "boundary_protected_opacity": opac[boundary_protected].detach(),
+            "final_pruned_opacity": opac[is_prune].detach(),
+            "final_pruned_radii": radii_all[is_prune].detach(),
+            "final_pruned_scale_max": scale_max[is_prune].detach(),
+        }
+        self._log_mesh_prune_diagnostics(state, step, source="refine")
+
         if n_prune > 0:
             remove(params=params, optimizers=optimizers, state=state, mask=is_prune)
 
