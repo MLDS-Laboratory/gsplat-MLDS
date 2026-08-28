@@ -45,7 +45,10 @@ class DefaultStrategy(Strategy):
         refine_scale2d_stop_iter (int): Stop refining GSs based on 2d scale after this
           iteration. Default is 0. Set to a positive value to enable this feature.
         refine_start_iter (int): Start refining GSs after this iteration. Default is 500.
-        refine_stop_iter (int): Stop refining GSs after this iteration. Default is 15_000.
+        refine_densify_stop_iter (Optional[int]): Stop duplicating/splitting GSs after
+          this iteration. If None, falls back to `refine_stop_iter`. Default is None.
+        refine_stop_iter (Optional[int]): Stop all refinement behavior after this
+          iteration. If None, never stop. Default is 15_000.
         reset_every (int): Reset opacities every this steps. Default is 3000.
         refine_every (int): Refine GSs every this steps. Default is 100.
         pause_refine_after_reset (int): Pause refining GSs until this number of steps after
@@ -84,7 +87,8 @@ class DefaultStrategy(Strategy):
     prune_scale2d: float = 0.15
     refine_scale2d_stop_iter: int = 0
     refine_start_iter: int = 500
-    refine_stop_iter: int = 15_000
+    refine_densify_stop_iter: Optional[int] = None
+    refine_stop_iter: Optional[int] = 15_000
     reset_every: int = 3000
     refine_every: int = 100
     pause_refine_after_reset: int = 0
@@ -93,6 +97,7 @@ class DefaultStrategy(Strategy):
     verbose: bool = False
     key_for_gradient: Literal["means2d", "gradient_2dgs"] = "means2d"
     prune_outside_extent: Optional[float] = None
+    cap_max: Optional[int] = None
 
     def initialize_state(self, scene_scale: float = 1.0) -> Dict[str, Any]:
         """Initialize and return the running state for this strategy.
@@ -105,7 +110,12 @@ class DefaultStrategy(Strategy):
         # - grad2d: running accum of the norm of the image plane gradients for each GS.
         # - count: running accum of how many time each GS is visible.
         # - radii: the radii of the GSs (normalized by the image resolution).
-        state = {"grad2d": None, "count": None, "scene_scale": scene_scale}
+        state = {
+            "grad2d": None,
+            "count": None,
+            "scene_scale": scene_scale,
+            "refinement_stop_printed": False,
+        }
         if self.refine_scale2d_stop_iter > 0:
             state["radii"] = None
         return state
@@ -158,7 +168,8 @@ class DefaultStrategy(Strategy):
         packed: bool = False,
     ):
         """Callback function to be executed after the `loss.backward()` call."""
-        if step >= self.refine_stop_iter:
+        if self._refinement_stopped(step):
+            self._maybe_print_refinement_stopped(state, step)
             return
 
         self._update_state(params, state, info, packed=packed)
@@ -168,8 +179,13 @@ class DefaultStrategy(Strategy):
             and step % self.refine_every == 0
             and step % self.reset_every >= self.pause_refine_after_reset
         ):
+            self._print_refinement_status(step)
+
             # grow GSs
-            n_dupli, n_split = self._grow_gs(params, optimizers, state, step)
+            if self._densification_stopped(step):
+                n_dupli, n_split = 0, 0
+            else:
+                n_dupli, n_split = self._grow_gs(params, optimizers, state, step)
             if self.verbose:
                 print(
                     f"Step {step}: {n_dupli} GSs duplicated, {n_split} GSs split. "
@@ -195,6 +211,43 @@ class DefaultStrategy(Strategy):
                 state=state,
                 value=self.prune_opa * 2.0,
             )
+
+    def _refinement_stopped(self, step: int) -> bool:
+        return self.refine_stop_iter is not None and step >= self.refine_stop_iter
+
+    def _densification_stopped(self, step: int) -> bool:
+        densify_stop_iter = self.refine_densify_stop_iter
+        if densify_stop_iter is None:
+            densify_stop_iter = self.refine_stop_iter
+        return densify_stop_iter is not None and step >= densify_stop_iter
+
+    def _screen_size_refinement_stopped(self, step: int) -> bool:
+        return self.refine_scale2d_stop_iter > 0 and step >= self.refine_scale2d_stop_iter
+
+    def _print_refinement_status(self, step: int) -> None:
+        if not self.verbose:
+            return
+        if self._screen_size_refinement_stopped(step):
+            print(
+                f"\033[33mStep {step}: screen-size culling/splitting is stopped (stop_screen_size_at={self.refine_scale2d_stop_iter}).\033[0m"
+            )
+        if self._densification_stopped(step):
+            densify_stop_iter = self.refine_densify_stop_iter
+            if densify_stop_iter is None:
+                densify_stop_iter = self.refine_stop_iter
+            print(
+                f"\033[33mStep {step}: Gaussian spawning is stopped (stop_spawn_at={densify_stop_iter}).\033[0m"
+            )
+
+    def _maybe_print_refinement_stopped(self, state: Dict[str, Any], step: int) -> None:
+        if not self.verbose:
+            return
+        if state.get("refinement_stop_printed", False):
+            return
+        state["refinement_stop_printed"] = True
+        print(
+            f"\033[38;5;208mStep {step}: all strategy refinement is stopped (stop_refinement_at={self.refine_stop_iter}).\033[0m"
+        )
 
     def _update_state(
         self,
@@ -269,12 +322,43 @@ class DefaultStrategy(Strategy):
         is_grad_high = grads > self.grow_grad2d
         is_small = torch.exp(params["scales"]).max(dim=-1).values <= self.grow_scale3d * state["scene_scale"]
         is_dupli = is_grad_high & is_small
-        n_dupli = is_dupli.sum().item()
-
         is_large = ~is_small
         is_split = is_grad_high & is_large
         if step < self.refine_scale2d_stop_iter:
             is_split |= state["radii"] > self.grow_scale2d
+
+        remaining = None if self.cap_max is None else int(self.cap_max) - int(len(params["means"]))
+        if remaining is not None:
+            if remaining <= 0:
+                return 0, 0
+
+            dupli_idx = torch.where(is_dupli)[0]
+            split_idx = torch.where(is_split)[0]
+
+            if dupli_idx.numel() + split_idx.numel() > remaining:
+                # Keep the highest-gradient candidates first when growth exceeds the cap.
+                scores = grads
+
+                keep_dupli = min(int(dupli_idx.numel()), remaining)
+                if dupli_idx.numel() > keep_dupli:
+                    top_dupli = torch.topk(scores[dupli_idx], k=keep_dupli, sorted=False).indices
+                    kept_dupli_idx = dupli_idx[top_dupli]
+                    new_is_dupli = torch.zeros_like(is_dupli)
+                    new_is_dupli[kept_dupli_idx] = True
+                    is_dupli = new_is_dupli
+                    dupli_idx = kept_dupli_idx
+
+                remaining -= int(dupli_idx.numel())
+                if remaining <= 0:
+                    is_split = torch.zeros_like(is_split)
+                elif split_idx.numel() > remaining:
+                    top_split = torch.topk(scores[split_idx], k=remaining, sorted=False).indices
+                    kept_split_idx = split_idx[top_split]
+                    new_is_split = torch.zeros_like(is_split)
+                    new_is_split[kept_split_idx] = True
+                    is_split = new_is_split
+
+        n_dupli = is_dupli.sum().item()
         n_split = is_split.sum().item()
 
         # first duplicate

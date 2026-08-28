@@ -236,9 +236,11 @@ rasterize_to_pixels_fwd_shadow_tensor(
     const torch::Tensor &gaussian_ids, // [nnz], packed->global Gaussian ids
     const torch::Tensor &depths,
     const torch::Tensor &shadow_num,   // [N_total], float32
-    const torch::Tensor &shadow_den,    // [N_total], float32
+    const torch::Tensor &shadow_den,   // [N_total], float32
     const float shadow_alpha_threshold,
-    const float shadow_depth_group_eps
+    const float shadow_depth_group_eps,
+    const bool use_shadow_receiver_bias,
+    const at::optional<torch::Tensor> &shadow_receiver_bias
 );
 
 std::tuple<torch::Tensor, torch::Tensor> rasterize_to_pixels_fwd_shadow_only_tensor(
@@ -258,7 +260,9 @@ std::tuple<torch::Tensor, torch::Tensor> rasterize_to_pixels_fwd_shadow_only_ten
     const torch::Tensor &shadow_num,
     const torch::Tensor &shadow_den,
     const float shadow_alpha_threshold,
-    const float shadow_depth_group_eps
+    const float shadow_depth_group_eps,
+    const bool use_shadow_receiver_bias,
+    const at::optional<torch::Tensor> &shadow_receiver_bias
 );
 
 std::tuple<torch::Tensor, torch::Tensor> rasterize_to_indices_in_range_tensor(

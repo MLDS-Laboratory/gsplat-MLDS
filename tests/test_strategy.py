@@ -100,7 +100,7 @@ def _make_meshaware_test_case():
     return params, optimizers, state, info, original_inside_parents
 
 
-def test_meshaware_min_gaussians_backfills_inside_candidates():
+def test_meshaware_reset_step_outside_prune_backfills_inside_candidates():
     from gsplat.strategy import MeshAwareStrategy
 
     params, optimizers, state, info, original_inside_parents = _make_meshaware_test_case()
@@ -113,17 +113,163 @@ def test_meshaware_min_gaussians_backfills_inside_candidates():
         min_gaussians_mode="outside_only",
     )
 
-    n_prune = strategy._prune_gs(params, optimizers, state, step=101, info=info)
+    n_prune = strategy._prune_outside_mesh_on_reset_step(params, optimizers, state, step=101, info=info)
 
     assert n_prune == 2
     assert params["means"].shape[0] == 4
     assert state["count"].shape[0] == 4
+    assert state["mesh_num_backfilled"] == 1
+    assert state["mesh_backfill_needed"] == 1
+    assert state["mesh_backfill_candidate_count"] == 3
+    assert state["mesh_last_backfill_step"] == 101
     assert tuple(params["means"][-1].detach().tolist()) in original_inside_parents
 
     remaining_means = {tuple(row.tolist()) for row in params["means"].detach()}
     assert (30.0, 0.0, 0.0) not in remaining_means
     assert (40.0, 0.0, 0.0) not in remaining_means
 
+
+def test_meshaware_strategy_normal_prune_skips_outside_mesh_gaussians():
+    from gsplat.strategy import MeshAwareStrategy
+
+    params, optimizers, state, info, _ = _make_meshaware_test_case()
+    strategy = MeshAwareStrategy(
+        prune_opa=0.05,
+        prune_scale3d=10.0,
+        prune_scale2d=10.0,
+        refine_scale2d_stop_iter=0,
+    )
+
+    n_prune = strategy._prune_gs(params, optimizers, state, step=101, info=info)
+
+    assert n_prune == 0
+    assert params["means"].shape[0] == 5
+
+
+def test_meshaware_prune_logs_diagnostics(monkeypatch):
+    from gsplat.strategy import MeshAwareStrategy
+
+    params = torch.nn.ParameterDict(
+        {
+            "means": torch.nn.Parameter(
+                torch.tensor(
+                    [
+                        [0.0, 0.0, 0.0],
+                        [0.1, 0.0, 0.0],
+                        [0.2, 0.0, 0.0],
+                    ]
+                )
+            ),
+            "scales": torch.nn.Parameter(torch.zeros(3, 3)),
+            "quats": torch.nn.Parameter(torch.randn(3, 4)),
+            "opacities": torch.nn.Parameter(torch.tensor([-8.0, -8.0, 4.0])),
+        }
+    )
+    optimizers = {k: torch.optim.Adam([v], lr=1e-3) for k, v in params.items()}
+    state = {"scene_scale": 1.0, "grad2d": torch.zeros(3), "count": torch.ones(3)}
+    info = {
+        "mesh_outside_mask": torch.tensor([False, False, True]),
+        "mesh_inside_mask": torch.tensor([True, False, False]),
+        "mesh_boundary_mask": torch.tensor([False, True, False]),
+    }
+    strategy = MeshAwareStrategy(verbose=True)
+
+    lines = []
+    monkeypatch.setattr("builtins.print", lambda *args, **kwargs: lines.append(" ".join(str(a) for a in args)))
+
+    n_prune = strategy._prune_gs(params, optimizers, state, step=101, info=info)
+
+    assert n_prune == 0
+    assert any(
+        "MeshAware prune diagnostics (refine):" in line
+        and "low_opacity=2" in line
+        and "mesh_protected=2" in line
+        and "inside_protected=1" in line
+        and "boundary_protected=1" in line
+        for line in lines
+    )
+
+
+def test_meshaware_custom_mesh_cull_schedule_can_run_without_reset(monkeypatch):
+    import gsplat.strategy.meshaware as meshaware_module
+    from gsplat.strategy import MeshAwareStrategy
+
+    params = torch.nn.ParameterDict(
+        {
+            "means": torch.nn.Parameter(torch.zeros(1, 3)),
+            "scales": torch.nn.Parameter(torch.zeros(1, 3)),
+            "quats": torch.nn.Parameter(torch.randn(1, 4)),
+            "opacities": torch.nn.Parameter(torch.zeros(1)),
+        }
+    )
+    optimizers = {k: torch.optim.Adam([v], lr=1e-3) for k, v in params.items()}
+    state = {"scene_scale": 1.0}
+    strategy = MeshAwareStrategy(
+        refine_start_iter=0,
+        refine_every=10,
+        reset_every=30,
+        mesh_cull_every=20,
+        pause_refine_after_reset=1000,
+    )
+
+    call_order = []
+
+    monkeypatch.setattr(strategy, "_update_state", lambda *args, **kwargs: None)
+
+    def fake_outside_prune(*args, **kwargs):
+        call_order.append("outside")
+        return 0
+
+    def fake_reset_opa(*args, **kwargs):
+        call_order.append("reset")
+
+    monkeypatch.setattr(strategy, "_prune_outside_mesh_on_reset_step", fake_outside_prune)
+    monkeypatch.setattr(meshaware_module, "reset_opa", fake_reset_opa)
+
+    strategy.step_post_backward(params, optimizers, state, step=20, info={})
+
+    assert call_order == ["outside"]
+
+
+def test_meshaware_overlap_mesh_cull_still_runs_before_reset_opa(monkeypatch):
+    import gsplat.strategy.meshaware as meshaware_module
+    from gsplat.strategy import MeshAwareStrategy
+
+    params = torch.nn.ParameterDict(
+        {
+            "means": torch.nn.Parameter(torch.zeros(1, 3)),
+            "scales": torch.nn.Parameter(torch.zeros(1, 3)),
+            "quats": torch.nn.Parameter(torch.randn(1, 4)),
+            "opacities": torch.nn.Parameter(torch.zeros(1)),
+        }
+    )
+    optimizers = {k: torch.optim.Adam([v], lr=1e-3) for k, v in params.items()}
+    state = {"scene_scale": 1.0}
+    strategy = MeshAwareStrategy(
+        refine_start_iter=0,
+        refine_every=10,
+        reset_every=30,
+        mesh_cull_every=30,
+        pause_refine_after_reset=1000,
+    )
+
+    call_order = []
+
+    monkeypatch.setattr(strategy, "_update_state", lambda *args, **kwargs: None)
+
+    def fake_outside_prune(*args, **kwargs):
+        call_order.append("outside")
+        return 0
+
+    def fake_reset_opa(*args, **kwargs):
+        call_order.append("reset")
+
+    monkeypatch.setattr(strategy, "_prune_outside_mesh_on_reset_step", fake_outside_prune)
+    monkeypatch.setattr(meshaware_module, "reset_opa", fake_reset_opa)
+
+    strategy.step_post_backward(params, optimizers, state, step=30, info={})
+
+    assert call_order == ["outside", "reset"]
 
 
 # Modification test: prune Gaussians that leave the random_scale box.
@@ -232,6 +378,56 @@ def test_meshaware_strategy_can_prune_big_inside_gaussians():
     assert n_prune == 1
     assert params["means"].shape[0] == 1
     assert torch.allclose(params["means"][0], torch.tensor([0.0, 0.0, 0.0]))
+
+
+def test_supportaware_strategy_can_lower_densification_threshold_for_supported_gaussians():
+    from gsplat.strategy import SupportAwareStrategy
+
+    params = torch.nn.ParameterDict(
+        {
+            "means": torch.nn.Parameter(
+                torch.tensor(
+                    [
+                        [0.0, 0.0, 0.0],
+                        [1.0, 0.0, 0.0],
+                    ]
+                )
+            ),
+            "scales": torch.nn.Parameter(torch.zeros(2, 3)),
+            "quats": torch.nn.Parameter(torch.randn(2, 4)),
+            "opacities": torch.nn.Parameter(torch.full((2,), 4.0)),
+        }
+    )
+    optimizers = {k: torch.optim.Adam([v], lr=1e-3) for k, v in params.items()}
+    state = {
+        "scene_scale": 1.0,
+        "grad2d": torch.tensor([0.6, 0.6]),
+        "count": torch.ones(2),
+        "support_count_ema": torch.tensor([1.0, 0.0]),
+        "support_grad_ema": torch.zeros(2),
+        "support_radii_ema": torch.zeros(2),
+    }
+
+    strategy = SupportAwareStrategy(
+        grow_grad2d=1.0,
+        grow_scale3d=1.0,
+        support_count_weight=1.0,
+        support_grad_weight=0.0,
+        support_radii_weight=0.0,
+        support_densify_score_thresh=0.5,
+        support_densify_grad_scale=0.5,
+        support_warmup_steps=0,
+    )
+
+    n_dupli, n_split = strategy._grow_gs(params, optimizers, state, step=1)
+
+    assert n_dupli == 1
+    assert n_split == 0
+    assert params["means"].shape[0] == 3
+    assert state["support_num_densified"] == 1
+    assert state["support_num_support_eased_densified"] == 1
+
+
 
 def test_meshaware_min_gaussians_mode_outside_only_does_not_backfill_non_outside_prunes():
     from gsplat.strategy import MeshAwareStrategy

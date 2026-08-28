@@ -1,6 +1,6 @@
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, Union
+from typing import Any, Dict, Optional, Union
 
 import torch
 from torch import Tensor
@@ -25,7 +25,10 @@ class MCMCStrategy(Strategy):
         cap_max (int): Maximum number of GSs. Default to 1_000_000.
         noise_lr (float): MCMC samping noise learning rate. Default to 5e5.
         refine_start_iter (int): Start refining GSs after this iteration. Default to 500.
-        refine_stop_iter (int): Stop refining GSs after this iteration. Default to 25_000.
+        refine_densify_stop_iter (Optional[int]): Stop relocation/addition after this
+          iteration. If None, falls back to `refine_stop_iter`. Default to None.
+        refine_stop_iter (Optional[int]): Stop all refinement behavior, including noise
+          injection, after this iteration. If None, never stop. Default to 25_000.
         refine_every (int): Refine GSs every this steps. Default to 100.
         min_opacity (float): GSs with opacity below this value will be pruned. Default to 0.005.
         verbose (bool): Whether to print verbose information. Default to False.
@@ -49,7 +52,8 @@ class MCMCStrategy(Strategy):
     cap_max: int = 1_000_000
     noise_lr: float = 5e5
     refine_start_iter: int = 500
-    refine_stop_iter: int = 25_000
+    refine_densify_stop_iter: Optional[int] = None
+    refine_stop_iter: Optional[int] = 25_000
     refine_every: int = 100
     min_opacity: float = 0.005
     verbose: bool = False
@@ -61,7 +65,7 @@ class MCMCStrategy(Strategy):
         for n in range(n_max):
             for k in range(n + 1):
                 binoms[n, k] = math.comb(n, k)
-        return {"binoms": binoms}
+        return {"binoms": binoms, "refinement_stop_printed": False}
 
     def check_sanity(
         self,
@@ -119,8 +123,19 @@ class MCMCStrategy(Strategy):
 
         binoms = state["binoms"]
 
+        if self._refinement_stopped(step):
+            self._maybe_print_refinement_stopped(state, step)
+            return
+
+        densify_stop_iter = self.refine_densify_stop_iter
+        if densify_stop_iter is None:
+            densify_stop_iter = self.refine_stop_iter
+
+        if step > self.refine_start_iter and step % self.refine_every == 0:
+            self._print_refinement_status(step, densify_stop_iter)
+
         if (
-            step < self.refine_stop_iter
+            (densify_stop_iter is None or step < densify_stop_iter)
             and step > self.refine_start_iter
             and step % self.refine_every == 0
         ):
@@ -142,6 +157,27 @@ class MCMCStrategy(Strategy):
         # add noise to GSs
         inject_noise_to_position(
             params=params, optimizers=optimizers, state={}, scaler=lr * self.noise_lr
+        )
+
+    def _refinement_stopped(self, step: int) -> bool:
+        return self.refine_stop_iter is not None and step >= self.refine_stop_iter
+
+    def _print_refinement_status(self, step: int, densify_stop_iter: Optional[int]) -> None:
+        if not self.verbose:
+            return
+        if densify_stop_iter is not None and step >= densify_stop_iter:
+            print(
+                f"\033[33mStep {step}: Gaussian spawning is stopped (stop_spawn_at={densify_stop_iter}).\033[0m"
+            )
+
+    def _maybe_print_refinement_stopped(self, state: Dict[str, Any], step: int) -> None:
+        if not self.verbose:
+            return
+        if state.get("refinement_stop_printed", False):
+            return
+        state["refinement_stop_printed"] = True
+        print(
+            f"\033[38;5;208mStep {step}: all strategy refinement is stopped (stop_refinement_at={self.refine_stop_iter}).\033[0m"
         )
 
     @torch.no_grad()

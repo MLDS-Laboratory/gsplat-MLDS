@@ -554,6 +554,8 @@ def rasterize_to_pixels_shadow_fwd(
     packed: bool = False,
     shadow_alpha_threshold: float = 1.0 / 1024.0,
     shadow_depth_group_eps: float = 0.0,
+    use_shadow_receiver_bias: bool = False,
+    shadow_receiver_bias: Optional[Tensor] = None,
 ):
     # active pipeline uses metadata-only shadow_mode plus exact shadow_den-based seen/unseen tests.
     C = isect_offsets.size(0)
@@ -562,6 +564,8 @@ def rasterize_to_pixels_shadow_fwd(
     # CUDA kernel expects gaussian_ids as int32 indices.
     gaussian_ids = gaussian_ids.to(dtype=torch.int32)
     depths = depths.to(dtype=torch.float32)
+    if shadow_receiver_bias is not None:
+        shadow_receiver_bias = shadow_receiver_bias.to(device=device, dtype=torch.float32).contiguous()
 
     shadow_num = torch.zeros((n_total_gaussians,), device=device, dtype=torch.float32)
     shadow_den = torch.zeros((n_total_gaussians,), device=device, dtype=torch.float32)
@@ -584,6 +588,8 @@ def rasterize_to_pixels_shadow_fwd(
         shadow_den,
         float(shadow_alpha_threshold),
         float(shadow_depth_group_eps),
+        bool(use_shadow_receiver_bias),
+        shadow_receiver_bias,
     )
 
     return renders, alphas.float(), shadow_num, shadow_den
@@ -607,11 +613,15 @@ def rasterize_to_pixels_shadow_only_fwd(
     packed: bool = False,
     shadow_alpha_threshold: float = 1.0 / 1024.0,
     shadow_depth_group_eps: float = 0.0,
+    use_shadow_receiver_bias: bool = False,
+    shadow_receiver_bias: Optional[Tensor] = None,
 ):
     device = means2d.device
 
     gaussian_ids = gaussian_ids.to(dtype=torch.int32)
     depths = depths.to(dtype=torch.float32)
+    if shadow_receiver_bias is not None:
+        shadow_receiver_bias = shadow_receiver_bias.to(device=device, dtype=torch.float32).contiguous()
 
     shadow_num = torch.zeros((n_total_gaussians,), device=device, dtype=torch.float32)
     shadow_den = torch.zeros((n_total_gaussians,), device=device, dtype=torch.float32)
@@ -634,6 +644,9 @@ def rasterize_to_pixels_shadow_only_fwd(
         shadow_den,
         float(shadow_alpha_threshold),
         float(shadow_depth_group_eps),
+        # receiver-bias shadow splatting
+        bool(use_shadow_receiver_bias),
+        shadow_receiver_bias,
     )
 
     return shadow_num, shadow_den

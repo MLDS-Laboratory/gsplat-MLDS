@@ -21,6 +21,68 @@ from .distributed import all_gather_int32, all_gather_tensor_list, all_to_all_in
 from .utils import depth_to_normal, get_projection_matrix
 
 
+def _evaluate_sh_channels(
+    means: Tensor,
+    viewmats: Tensor,
+    radii: Tensor,
+    coeffs: Tensor,
+    sh_degree: int,
+    packed: bool,
+    camera_ids: Optional[Tensor],
+    gaussian_ids: Optional[Tensor],
+) -> Tensor:
+    """Evaluate SH coefficients to direct per-view channels without changing kernel code."""
+    original_channels = coeffs.shape[-1]
+
+    def _pad_coeff_channels(shs: Tensor) -> Tensor:
+        # The SH kernel still evaluates 3 channels internally, so pad lower-D outputs.
+        if shs.shape[-1] >= 3:
+            return shs
+        pad_shape = (*shs.shape[:-1], 3 - shs.shape[-1])
+        padding = torch.zeros(pad_shape, device=shs.device, dtype=shs.dtype)
+        return torch.cat((shs, padding), dim=-1)
+
+    camtoworlds = torch.inverse(viewmats)
+    if packed:
+        assert camera_ids is not None
+        assert gaussian_ids is not None
+        dirs = means[gaussian_ids, :] - camtoworlds[camera_ids, :3, 3]
+        masks = radii > 0
+        if coeffs.dim() == 3:
+            # Turn [N, K, D] into [nnz, K, D].
+            shs = coeffs[gaussian_ids, :, :]
+        else:
+            # Turn [C, N, K, D] into [nnz, K, D].
+            shs = coeffs[camera_ids, gaussian_ids, :, :]
+        shs = _pad_coeff_channels(shs)
+        evaluated = spherical_harmonics(
+            sh_degree,
+            dirs,
+            shs,
+            masks=masks,
+            num_output_channels=shs.shape[-1],
+        )
+        return evaluated[..., :original_channels]
+
+    dirs = means[None, :, :] - camtoworlds[:, None, :3, 3]
+    masks = radii > 0
+    if coeffs.dim() == 3:
+        # Turn [N, K, D] into [C, N, K, D].
+        shs = coeffs.expand(viewmats.shape[0], -1, -1, -1)
+    else:
+        # coeffs is already [C, N, K, D].
+        shs = coeffs
+    shs = _pad_coeff_channels(shs)
+    evaluated = spherical_harmonics(
+        sh_degree,
+        dirs,
+        shs,
+        masks=masks,
+        num_output_channels=shs.shape[-1],
+    )
+    return evaluated[..., :original_channels]
+
+
 def rasterization(
     means: Tensor,  # [N, 3]
     quats: Tensor,  # [N, 4]
@@ -53,6 +115,8 @@ def rasterization(
     n_total_gaussians: Optional[int] = None,
     shadow_alpha_threshold: float = 1.0 / 1024.0,
     shadow_depth_group_eps: float = 0.0,
+    use_shadow_receiver_bias: bool = False,
+    shadow_receiver_bias: Optional[Tensor] = None,
     shadow_return_images: bool = False,
 ) -> Tuple[Tensor, Tensor, Dict]:
     """Rasterize a set of 3D Gaussians (N) to a batch of image planes (C).
@@ -276,11 +340,7 @@ def rasterization(
     if aux_colors is not None:
         assert aux_colors.device == device, aux_colors.device
         assert aux_colors.dim() in (2, 3), aux_colors.shape
-        assert (
-            aux_colors.shape[0] == N
-            if aux_colors.dim() == 2
-            else aux_colors.shape[:2] == (C, N)
-        ), aux_colors.shape
+        assert aux_colors.shape[0] == N if aux_colors.dim() == 2 else aux_colors.shape[:2] == (C, N), aux_colors.shape
         if distributed:
             assert aux_colors.dim() == 2, "Distributed mode only supports per-Gaussian aux colors."
         if render_mode in ["D", "ED"]:
@@ -397,42 +457,21 @@ def rasterization(
                 # colors is already [C, N, D]
                 pass
     else:
-        # Colors are SH coefficients, with shape [N, K, 3] or [C, N, K, 3]
-        camtoworlds = torch.inverse(viewmats)  # [C, 4, 4]
-        if packed:
-            dirs = means[gaussian_ids, :] - camtoworlds[camera_ids, :3, 3]  # [nnz, 3]
-            masks = radii > 0  # [nnz]
-            if colors.dim() == 3:
-                # Turn [N, K, 3] into [nnz, 3]
-                shs = colors[gaussian_ids, :, :]  # [nnz, K, 3]
-            else:
-                # Turn [C, N, K, 3] into [nnz, 3]
-                shs = colors[camera_ids, gaussian_ids, :, :]  # [nnz, K, 3]
-            colors = spherical_harmonics(sh_degree, dirs, shs, masks=masks)  # [nnz, 3]
-        else:
-            dirs = means[None, :, :] - camtoworlds[:, None, :3, 3]  # [C, N, 3]
-            masks = radii > 0  # [C, N]
-            if colors.dim() == 3:
-                # Turn [N, K, 3] into [C, N, K, 3]
-                shs = colors.expand(C, -1, -1, -1)  # [C, N, K, 3]
-            else:
-                # colors is already [C, N, K, 3]
-                shs = colors
-            if colors.shape[-1] == 1:
-                # We need to expand to 3 for SH rendering
-                shs = shs.expand(-1, -1, -1, 3)
-            colors = spherical_harmonics(
-                sh_degree,
-                dirs,
-                shs,
-                masks=masks,
-                num_output_channels=3,
-            )  # [C, N, 3]
+        # Colors are SH coefficients, with shape [N, K, D] or [C, N, K, D]
+        colors = _evaluate_sh_channels(
+            means=means,
+            viewmats=viewmats,
+            radii=radii,
+            coeffs=colors,
+            sh_degree=sh_degree,
+            packed=packed,
+            camera_ids=camera_ids,
+            gaussian_ids=gaussian_ids,
+        )
         # make it apple-to-apple with Inria's CUDA Backend.
         colors = torch.clamp_min(colors + 0.5, 0.0)
-
-        # Extract only the required number of output channels from the SH result
-        if num_output_channels < 3:
+        # Extract only the requested output channels from the SH result.
+        if colors.shape[-1] > num_output_channels:
             colors = colors[..., :num_output_channels]
 
     main_channel_count = colors.shape[-1]
@@ -447,6 +486,7 @@ def rasterization(
                 aux_colors = aux_colors.expand(C, -1, -1)
             else:
                 pass
+        aux_channel_count = aux_colors.shape[-1]
 
     # If in distributed mode, we need to scatter the GSs to the destination ranks, based
     # on which cameras they are visible to, which we already figured out in the projection
@@ -606,6 +646,10 @@ def rasterization(
     if shadow_mode:
         assert packed, "shadow_mode currently expects packed=True"
         assert n_total_gaussians is not None, "Need n_total_gaussians in shadow_mode"
+        if use_shadow_receiver_bias:
+            assert shadow_receiver_bias is not None, "shadow_receiver_bias is required when enabled."
+            assert shadow_receiver_bias.shape == (n_total_gaussians,), shadow_receiver_bias.shape
+            shadow_receiver_bias = shadow_receiver_bias.to(device=device, dtype=torch.float32).contiguous()
         if shadow_return_images:
             raise ValueError("shadow_mode is metadata-only; light-view image outputs are temporarily deprecated")
 
@@ -627,6 +671,9 @@ def rasterization(
             packed=packed,
             shadow_alpha_threshold=shadow_alpha_threshold,
             shadow_depth_group_eps=shadow_depth_group_eps,
+            # receiver-bias shadow splatting
+            use_shadow_receiver_bias=use_shadow_receiver_bias,
+            shadow_receiver_bias=shadow_receiver_bias,
         )
         render_colors = torch.empty((0,), device=device, dtype=torch.float32)
         render_alphas = torch.empty((0,), device=device, dtype=torch.float32)

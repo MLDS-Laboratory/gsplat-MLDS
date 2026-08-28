@@ -40,7 +40,10 @@ __global__ void rasterize_to_pixels_fwd_kernel(
     float *__restrict__ shadow_num,           // [N_total] or nullptr
     float *__restrict__ shadow_den,            // [N_total] or nullptr
     const S shadow_alpha_threshold,
-    const S shadow_depth_group_eps
+    const S shadow_depth_group_eps,
+    // receiver-bias shadow splatting
+    const bool use_shadow_receiver_bias,
+    const S *__restrict__ shadow_receiver_bias
 ) {
     // each thread draws one pixel, but also timeshares caching gaussians in a
     // shared tile
@@ -118,7 +121,8 @@ __global__ void rasterize_to_pixels_fwd_kernel(
     uint32_t cur_idx = 0;
 
     const bool shadow_mode = shadow_num != nullptr;
-
+    const bool use_receiver_bias =
+        shadow_mode && use_shadow_receiver_bias && shadow_receiver_bias != nullptr;
 
     // collect and process batches of gaussians
     // each thread loads one gaussian at a time before rasterizing its
@@ -164,7 +168,7 @@ __global__ void rasterize_to_pixels_fwd_kernel(
                 continue;
             }
 
-            if (shadow_mode && shadow_depth_group_eps > 0.0f) {
+            if (shadow_mode && (shadow_depth_group_eps > 0.0f || use_receiver_bias)) {
                 const S group_depth = depth_batch[t];
                 const S T_group = T;
                 S T_after_group = T_group;
@@ -172,7 +176,16 @@ __global__ void rasterize_to_pixels_fwd_kernel(
 
                 while (u < batch_size) {
                     const S depth_u = depth_batch[u];
-                    if ((depth_u - group_depth) > shadow_depth_group_eps) {
+                    const int32_t g_u = id_batch[u];
+                    const int32_t gid_u = packed ? gaussian_ids[g_u] : g_u;
+                    // receiver-bias shadow splatting
+                    // Depths increase away from the light here, so receiver_depth - blocker_depth
+                    // is positive when the blocker is closer to the light than the receiver.
+                    S depth_gap = depth_u - group_depth;
+                    if (use_receiver_bias) {
+                        depth_gap -= shadow_receiver_bias[gid_u];
+                    }
+                    if (depth_gap > shadow_depth_group_eps) {
                         break;
                     }
 
@@ -187,8 +200,6 @@ __global__ void rasterize_to_pixels_fwd_kernel(
                     const S alpha_u = min(0.999f, opac_u * beta_u);
 
                     if (!(sigma_u < 0.f || alpha_u < shadow_alpha_threshold)) {
-                        const int32_t g_u = id_batch[u];
-                        const int32_t gid_u = packed ? gaussian_ids[g_u] : g_u;
                         const S w_u = beta_u;
                         
                         //GS3-style raw shadow source = cumulative opacity before the group
@@ -368,7 +379,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> call_kernel_with_dim(
             nullptr,
             nullptr,
             0.0f,
-            0.0f
+            0.0f,
+            false,
+            nullptr
         );
 
     return std::make_tuple(renders, alphas, last_ids);
@@ -395,7 +408,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     const torch::Tensor &shadow_num,
     const torch::Tensor &shadow_den,
     const float shadow_alpha_threshold,
-    const float shadow_depth_group_eps
+    const float shadow_depth_group_eps,
+    const bool use_shadow_receiver_bias,
+    const at::optional<torch::Tensor> &shadow_receiver_bias
 ) {
     GSPLAT_DEVICE_GUARD(means2d);
     GSPLAT_CHECK_INPUT(means2d);
@@ -410,6 +425,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     }
     if (masks.has_value()) {
         GSPLAT_CHECK_INPUT(masks.value());
+    }
+    if (shadow_receiver_bias.has_value()) {
+        GSPLAT_CHECK_INPUT(shadow_receiver_bias.value());
     }
     bool packed = means2d.dim() == 2;
 
@@ -484,7 +502,11 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             shadow_num.data_ptr<float>(),
             shadow_den.data_ptr<float>(),
             shadow_alpha_threshold,
-            shadow_depth_group_eps
+            shadow_depth_group_eps,
+            use_shadow_receiver_bias,
+            shadow_receiver_bias.has_value()
+                ? shadow_receiver_bias.value().data_ptr<float>()
+                : nullptr
         );
 
     return std::make_tuple(renders, alphas, last_ids, shadow_num, shadow_den);
@@ -511,7 +533,9 @@ std::tuple<torch::Tensor, torch::Tensor> call_kernel_with_dim_shadow_only(
     const torch::Tensor &shadow_num,
     const torch::Tensor &shadow_den,
     const float shadow_alpha_threshold,
-    const float shadow_depth_group_eps
+    const float shadow_depth_group_eps,
+    const bool use_shadow_receiver_bias,
+    const at::optional<torch::Tensor> &shadow_receiver_bias
 ) {
     GSPLAT_DEVICE_GUARD(means2d);
     GSPLAT_CHECK_INPUT(means2d);
@@ -526,6 +550,9 @@ std::tuple<torch::Tensor, torch::Tensor> call_kernel_with_dim_shadow_only(
     }
     if (masks.has_value()) {
         GSPLAT_CHECK_INPUT(masks.value());
+    }
+    if (shadow_receiver_bias.has_value()) {
+        GSPLAT_CHECK_INPUT(shadow_receiver_bias.value());
     }
     bool packed = means2d.dim() == 2;
 
@@ -584,7 +611,11 @@ std::tuple<torch::Tensor, torch::Tensor> call_kernel_with_dim_shadow_only(
             shadow_num.data_ptr<float>(),
             shadow_den.data_ptr<float>(),
             shadow_alpha_threshold,
-            shadow_depth_group_eps
+            shadow_depth_group_eps,
+            use_shadow_receiver_bias,
+            shadow_receiver_bias.has_value()
+                ? shadow_receiver_bias.value().data_ptr<float>()
+                : nullptr
         );
 
     return std::make_tuple(shadow_num, shadow_den);
@@ -677,7 +708,9 @@ rasterize_to_pixels_fwd_shadow_tensor(
     const torch::Tensor &shadow_num,
     const torch::Tensor &shadow_den,
     const float shadow_alpha_threshold,
-    const float shadow_depth_group_eps
+    const float shadow_depth_group_eps,
+    const bool use_shadow_receiver_bias,
+    const at::optional<torch::Tensor> &shadow_receiver_bias
 ) {
     GSPLAT_CHECK_INPUT(colors);
     uint32_t channels = colors.size(-1);
@@ -701,7 +734,9 @@ rasterize_to_pixels_fwd_shadow_tensor(
             shadow_num,                                                        \
             shadow_den,                                                        \
             shadow_alpha_threshold,                                            \
-            shadow_depth_group_eps                                             \
+            shadow_depth_group_eps,                                            \
+            use_shadow_receiver_bias,                                          \
+            shadow_receiver_bias                                               \
         );
 
     // TODO: an optimization can be done by passing the actual number of
@@ -755,7 +790,9 @@ rasterize_to_pixels_fwd_shadow_only_tensor(
     const torch::Tensor &shadow_num,
     const torch::Tensor &shadow_den,
     const float shadow_alpha_threshold,
-    const float shadow_depth_group_eps
+    const float shadow_depth_group_eps,
+    const bool use_shadow_receiver_bias,
+    const at::optional<torch::Tensor> &shadow_receiver_bias
 ) {
     GSPLAT_CHECK_INPUT(colors);
     uint32_t channels = colors.size(-1);
@@ -779,7 +816,9 @@ rasterize_to_pixels_fwd_shadow_only_tensor(
             shadow_num,                                                        \
             shadow_den,                                                        \
             shadow_alpha_threshold,                                            \
-            shadow_depth_group_eps                                             \
+            shadow_depth_group_eps,                                            \
+            use_shadow_receiver_bias,                                          \
+            shadow_receiver_bias                                               \
         );
 
     switch (channels) {
