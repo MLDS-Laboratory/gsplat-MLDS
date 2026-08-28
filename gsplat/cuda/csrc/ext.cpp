@@ -42,6 +42,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "rasterize_to_pixels_fwd_shadow_only",
         &gsplat::rasterize_to_pixels_fwd_shadow_only_tensor
     );
+    m.def(
+        "rasterize_to_pixels_bwd_shadow_only",
+        &gsplat::rasterize_to_pixels_bwd_shadow_only_tensor
+    );
 
     m.def(
         "rasterize_to_indices_in_range",
