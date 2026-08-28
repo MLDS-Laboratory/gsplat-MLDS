@@ -14,7 +14,7 @@ from .cuda._wrapper import (
     isect_tiles,
     rasterize_to_pixels,
     rasterize_to_pixels_2dgs,
-    rasterize_to_pixels_shadow_only_fwd,
+    rasterize_to_pixels_shadow_only,
     spherical_harmonics,
 )
 from .distributed import all_gather_int32, all_gather_tensor_list, all_to_all_int32, all_to_all_tensor_list
@@ -653,7 +653,7 @@ def rasterization(
         if shadow_return_images:
             raise ValueError("shadow_mode is metadata-only; light-view image outputs are temporarily deprecated")
 
-        shadow_vis_num, shadow_vis_den = rasterize_to_pixels_shadow_only_fwd(
+        shadow_vis_num, shadow_vis_den = rasterize_to_pixels_shadow_only(
             means2d,
             conics,
             colors,

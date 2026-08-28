@@ -652,6 +652,179 @@ def rasterize_to_pixels_shadow_only_fwd(
     return shadow_num, shadow_den
 
 
+class _RasterizeToPixelsShadowOnly(torch.autograd.Function):
+    """Autograd wrapper for metadata-only raw shadow splatting.
+
+    The forward kernel remains the production shadow-only kernel.  Its CUDA
+    backward replays the selected splats and returns the local derivative with
+    respect to projected means, conics, and opacities.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        means2d: Tensor,
+        conics: Tensor,
+        opacities: Tensor,
+        isect_offsets: Tensor,
+        flatten_ids: Tensor,
+        gaussian_ids: Tensor,
+        depths: Tensor,
+        n_total_gaussians: int,
+        image_width: int,
+        image_height: int,
+        tile_size: int,
+        shadow_alpha_threshold: float,
+        shadow_depth_group_eps: float,
+        use_shadow_receiver_bias: bool,
+        shadow_receiver_bias: Optional[Tensor],
+    ) -> Tuple[Tensor, Tensor]:
+        device = means2d.device
+        shadow_num = torch.zeros((n_total_gaussians,), device=device, dtype=torch.float32)
+        shadow_den = torch.zeros((n_total_gaussians,), device=device, dtype=torch.float32)
+        shadow_num, shadow_den = _make_lazy_cuda_func("rasterize_to_pixels_fwd_shadow_only")(
+            means2d.contiguous(),
+            conics.contiguous(),
+            torch.zeros((means2d.shape[0], 1), device=device, dtype=torch.float32),
+            opacities.contiguous(),
+            None,
+            None,
+            image_width,
+            image_height,
+            tile_size,
+            isect_offsets.contiguous(),
+            flatten_ids.contiguous(),
+            gaussian_ids.contiguous(),
+            depths.contiguous(),
+            shadow_num,
+            shadow_den,
+            float(shadow_alpha_threshold),
+            float(shadow_depth_group_eps),
+            bool(use_shadow_receiver_bias),
+            shadow_receiver_bias,
+        )
+        ctx.save_for_backward(
+            means2d,
+            conics,
+            opacities,
+            isect_offsets,
+            flatten_ids,
+            gaussian_ids,
+            depths,
+            shadow_receiver_bias if shadow_receiver_bias is not None else torch.empty(0, device=device),
+        )
+        ctx.n_total_gaussians = n_total_gaussians
+        ctx.image_width = image_width
+        ctx.image_height = image_height
+        ctx.tile_size = tile_size
+        ctx.shadow_alpha_threshold = shadow_alpha_threshold
+        ctx.shadow_depth_group_eps = shadow_depth_group_eps
+        ctx.use_shadow_receiver_bias = use_shadow_receiver_bias
+        ctx.has_shadow_receiver_bias = shadow_receiver_bias is not None
+        return shadow_num, shadow_den
+
+    @staticmethod
+    def backward(ctx, v_shadow_num: Optional[Tensor], v_shadow_den: Optional[Tensor]):
+        (
+            means2d,
+            conics,
+            opacities,
+            isect_offsets,
+            flatten_ids,
+            gaussian_ids,
+            depths,
+            saved_receiver_bias,
+        ) = ctx.saved_tensors
+        if v_shadow_num is None:
+            v_shadow_num = torch.zeros((ctx.n_total_gaussians,), device=means2d.device, dtype=torch.float32)
+        if v_shadow_den is None:
+            v_shadow_den = torch.zeros((ctx.n_total_gaussians,), device=means2d.device, dtype=torch.float32)
+        receiver_bias = saved_receiver_bias if ctx.has_shadow_receiver_bias else None
+        v_means2d, v_conics, v_opacities = _make_lazy_cuda_func("rasterize_to_pixels_bwd_shadow_only")(
+            means2d.contiguous(),
+            conics.contiguous(),
+            opacities.contiguous(),
+            isect_offsets.contiguous(),
+            flatten_ids.contiguous(),
+            gaussian_ids.contiguous(),
+            depths.contiguous(),
+            v_shadow_num.contiguous(),
+            v_shadow_den.contiguous(),
+            ctx.image_width,
+            ctx.image_height,
+            ctx.tile_size,
+            float(ctx.shadow_alpha_threshold),
+            float(ctx.shadow_depth_group_eps),
+            bool(ctx.use_shadow_receiver_bias),
+            receiver_bias,
+        )
+        return (
+            v_means2d,
+            v_conics,
+            v_opacities,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
+def rasterize_to_pixels_shadow_only(
+    means2d: Tensor,
+    conics: Tensor,
+    colors: Tensor,
+    opacities: Tensor,
+    image_width: int,
+    image_height: int,
+    tile_size: int,
+    isect_offsets: Tensor,
+    flatten_ids: Tensor,
+    gaussian_ids: Tensor,
+    depths: Tensor,
+    n_total_gaussians: int,
+    backgrounds: Optional[Tensor] = None,
+    masks: Optional[Tensor] = None,
+    packed: bool = False,
+    shadow_alpha_threshold: float = 1.0 / 1024.0,
+    shadow_depth_group_eps: float = 0.0,
+    use_shadow_receiver_bias: bool = False,
+    shadow_receiver_bias: Optional[Tensor] = None,
+):
+    del colors, packed
+    if backgrounds is not None or masks is not None:
+        raise ValueError("Differentiable metadata-only shadow rasterization does not support backgrounds or masks.")
+    device = means2d.device
+    gaussian_ids = gaussian_ids.to(device=device, dtype=torch.int32).contiguous()
+    depths = depths.to(device=device, dtype=torch.float32).contiguous()
+    if shadow_receiver_bias is not None:
+        shadow_receiver_bias = shadow_receiver_bias.to(device=device, dtype=torch.float32).contiguous()
+    return _RasterizeToPixelsShadowOnly.apply(
+        means2d,
+        conics,
+        opacities,
+        isect_offsets,
+        flatten_ids,
+        gaussian_ids,
+        depths,
+        n_total_gaussians,
+        image_width,
+        image_height,
+        tile_size,
+        shadow_alpha_threshold,
+        shadow_depth_group_eps,
+        use_shadow_receiver_bias,
+        shadow_receiver_bias,
+    )
+
+
 @torch.no_grad()
 def rasterize_to_indices_in_range(
     range_start: int,
